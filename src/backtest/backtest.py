@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import json
 import streamlit as st
-from .data_fetcher import BacktestDataManager # Make sure this import is correct
+from src.backtest.data_fetcher import BacktestDataManager # Make sure this import is correct
 
 
 class BacktestResult:

@@ -1,13 +1,27 @@
 import os
+import sys
 import time
 from datetime import datetime, timedelta, time # Import time
 from zoneinfo import ZoneInfo # Import ZoneInfo
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+# --- NEW: Fix for ModuleNotFoundError: No module named 'src' ---
+# Get the absolute path of the current file (streamlit_app.py)
+current_file_path = os.path.abspath(__file__)
+# Get the path to the 'ui' directory
+ui_dir = os.path.dirname(current_file_path)
+# Get the path to the 'src' directory (one level up)
+src_dir = os.path.dirname(ui_dir)
+# Get the path to the project root 'bot' (one level up from 'src')
+project_root = os.path.dirname(src_dir)
 
-from fetcher.angel_client import AngelClient
-from backtest.backtest import StrategyTester, CUSTOM_STRATEGY_TEMPLATE # No longer needed
+# Add the project root to the Python path
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+# --- END FIX ---
+from src.fetcher.angel_client import AngelClient
+from src.backtest.backtest import StrategyTester, CUSTOM_STRATEGY_TEMPLATE # No longer needed
 
 # ---------------------------
 # Load environment variables

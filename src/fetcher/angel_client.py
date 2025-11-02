@@ -10,9 +10,9 @@ try:
 except Exception:
     SmartClient = None
 
-from .real_market_data import RealMarketData
-from .market_analyzer import MarketAnalyzer
-from .signal_storage import SignalStorage
+from src.fetcher.real_market_data import RealMarketData
+from src.fetcher.market_analyzer import MarketAnalyzer
+from src.fetcher.signal_storage import SignalStorage
 
 
 class AngelClient:

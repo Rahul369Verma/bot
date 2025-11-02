@@ -4,7 +4,7 @@ load_dotenv()
 
 import streamlit as st
 from kiteconnect import KiteConnect
-from fetcher.kite_client import KiteClient
+from src.fetcher.kite_client import KiteClient
 from urllib.parse import urlparse, parse_qs
 
 st.title("BankNifty Options Bot")
