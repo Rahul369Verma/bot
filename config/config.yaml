@@ -1,0 +1,21 @@
+# config/config.yaml
+bot:
+  name: banknifty-monthly-ema-scalp
+  mode: paper
+  broker: angel
+  underlying: BANKNIFTY
+  strike_round: 100
+strategy:
+  candle_interval_min: 5
+  confirmation_candles: 15
+  ema_short: 9
+  ema_long: 15
+  lot_size: 15
+  max_positions: 1
+  qty_per_trade: 1          # number of lots (use integer)
+risk:
+  max_daily_loss: 50000
+  stop_loss_points: 200     # points from entry (example)
+  target_points: 300
+logging:
+  level: INFO

@@ -1,0 +1,10 @@
+.env
+// ignore packages from requirements.txt
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/

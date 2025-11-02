@@ -1,0 +1,12 @@
+kiteconnect==5.0.1
+pandas
+numpy
+psycopg2-binary
+sqlalchemy
+streamlit
+requests
+python-dotenv
+uvicorn
+smartapi-python
+pyotp
+plotly>=5.0.0
