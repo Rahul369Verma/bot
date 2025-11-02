@@ -1,22 +1,18 @@
 import os
 import sys
 import time
-from datetime import datetime, timedelta, time # Import time
-from zoneinfo import ZoneInfo # Import ZoneInfo
+from datetime import datetime, timedelta, time as dt_time # Renamed to avoid conflict
+from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-# --- NEW: Fix for ModuleNotFoundError: No module named 'src' ---
-# Get the absolute path of the current file (streamlit_app.py)
-current_file_path = os.path.abspath(__file__)
-# Get the path to the 'ui' directory
-ui_dir = os.path.dirname(current_file_path)
-# Get the path to the 'src' directory (one level up)
-src_dir = os.path.dirname(ui_dir)
-# Get the path to the project root 'bot' (one level up from 'src')
-project_root = os.path.dirname(src_dir)
+import threading # Import threading
 
-# Add the project root to the Python path
+# --- Fix for ModuleNotFoundError: No module named 'src' ---
+current_file_path = os.path.abspath(__file__)
+ui_dir = os.path.dirname(current_file_path)
+src_dir = os.path.dirname(ui_dir)
+project_root = os.path.dirname(src_dir)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 # --- END FIX ---
@@ -28,16 +24,59 @@ from src.backtest.backtest import StrategyTester, CUSTOM_STRATEGY_TEMPLATE # No 
 # ---------------------------
 load_dotenv()
 UNDERLYING = "BANKNIFTY"
-# --- UPDATED ---
-REFRESH_INTERVAL = 30  # seconds
-IST = ZoneInfo('Asia/Kolkata') # Define IST Timezone
+# --- UPDATED: Bot logic will now run every 30s ---
+BOT_HEARTBEAT_SECONDS = 30
+UI_REFRESH_SECONDS = 15
+IST = ZoneInfo('Asia/Kolkata') 
+
+# ---------------------------
+# The Bot's "Heartbeat" Loop
+# ---------------------------
+def bot_loop(client: AngelClient):
+    """
+    This function runs in a separate, persistent background thread.
+    It is the "brain" of your bot.
+    """
+    print("✅ Bot background thread started. Waiting for the next 30-second mark to align...")
+    while True:
+        try:
+            # --- NEW: Self-Correcting 30-Second Alignment ---
+            # This loop will always wake up on the :00 or :30 of a minute
+            current_time = time.time()
+            # Calculate how many seconds to wait to hit the next 30-second mark
+            seconds_to_wait = BOT_HEARTBEAT_SECONDS - (current_time % BOT_HEARTBEAT_SECONDS)
+            
+            # Sleep for that precise duration
+            time.sleep(seconds_to_wait)
+            # --- END NEW ---
+
+            now_ist = datetime.now(IST)
+            is_market_open = (now_ist.weekday() < 5) and (dt_time(9, 15) <= now_ist.time() <= dt_time(15, 30))
+
+            # Print heartbeat to the TERMINAL
+            # This will now always show :00 or :30
+            print(f"[{now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}] Bot Heartbeat. Market Open: {is_market_open}")
+
+            if is_market_open:
+                # Only run trading logic if market is open
+                client.check_new_day()
+                client.check_and_close_positions()
+                signals = client.generate_continuous_signals()
+            
+            # The main sleep is now at the top of the loop
+
+        except Exception as e:
+            print(f"❌ CRITICAL ERROR in bot_loop: {e}")
+            time.sleep(5) # Wait 5s before retrying after an error
 
 # ---------------------------
 # Initialize Angel Client
 # ---------------------------
 @st.cache_resource
 def init_angel_client():
-    """Initialize Angel Client"""
+    """
+    Initialize the Angel Client. This runs only ONCE.
+    """
     try:
         client = AngelClient(paper=True)
         return client
@@ -46,6 +85,21 @@ def init_angel_client():
         return None
 
 angel = init_angel_client()
+
+# ---------------------------
+# Start the Bot Thread (Runs Once)
+# ---------------------------
+if 'bot_thread_running' not in st.session_state:
+    if angel:
+        print("Starting bot background thread...")
+        # Start the bot_loop function in a new thread
+        # daemon=True means the thread will close when the main app stops
+        t = threading.Thread(target=bot_loop, args=(angel,), daemon=True)
+        t.start()
+        st.session_state['bot_thread_running'] = True
+        print("✅ Bot background thread is now running.")
+    else:
+        st.error("Cannot start bot thread: Angel Client failed to initialize.")
 
 # ---------------------------
 # Helper functions
@@ -59,7 +113,7 @@ def safe_dataframe_formatting(df, columns_format):
                  except Exception: pass
     return df_formatted
 def format_volume(volume):
-    if pd.isna(volume): return "N/A"
+    if pd.isna(volume): return "N_A"
     volume = float(volume)
     if volume >= 1000000: return f"{volume/1000000:.1f}M"
     elif volume >= 1000: return f"{volume/1000:.1f}K"
@@ -70,7 +124,7 @@ def highlight_atm(row, atm_strike):
     return [style if is_atm else '' for _ in row]
 
 # ---------------------------
-# Streamlit Layout
+# Streamlit Layout (The Dashboard)
 # ---------------------------
 st.set_page_config(page_title="BankNifty Live Bot", layout="wide")
 st.title(f"🎯 BankNifty Live Trading Bot {'(PAPER MODE)' if angel.paper else '(REAL MONEY MODE)'}")
@@ -80,34 +134,9 @@ if angel.paper:
 else:
     st.error("WARNING: Bot is in REAL MONEY mode. Real trades will be placed.")
 
-# ---------------------------
-# Auto-refresh & Main Bot Loop
-# ---------------------------
 # Check market hours
 now_ist = datetime.now(IST)
-is_market_open = (now_ist.weekday() < 5) and (time(9, 15) <= now_ist.time() <= time(15, 30))
-
-if angel:
-    try:
-        if is_market_open:
-            # Only run trading logic if market is open
-            angel.check_new_day()
-            angel.check_and_close_positions()
-            signals = angel.generate_continuous_signals()
-        
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=REFRESH_INTERVAL * 1000, limit=None, key="refresh")
-        
-    except ImportError:
-        if st.button("🔄 Manual Refresh Bot"):
-            st.rerun()
-    except Exception as e:
-        # Don't show the full error, just the message
-        st.error(f"Error in main bot loop: {e}")
-else:
-    st.error("Angel Client not initialized. Bot cannot run.")
-    st.stop()
-
+is_market_open = (now_ist.weekday() < 5) and (dt_time(9, 15) <= now_ist.time() <= dt_time(15, 30))
 
 # ---------------------------
 # Bot Status Dashboard
@@ -156,7 +185,7 @@ if angel:
         with col4:
             ema_diff = ema_data['ema_9'] - ema_data['ema_15']; trend = "BULLISH" if ema_diff > 0 else "BEARISH"
             st.metric("5m Trend", trend, delta=f"₹{ema_diff:,.2f}")
-        with col5: st.metric("Last Update", datetime.now().strftime("%H:%M:%S"))
+        with col5: st.metric("Last Update (IST)", now_ist.strftime("%H:%M:%S"))
         
     except Exception as e:
         st.error(f"❌ Failed to load market data: {e}")
@@ -204,8 +233,6 @@ st.subheader("📋 Real Option Chain")
 if angel:
     try:
         all_expiry_dates = angel.get_expiry_dates()
-        
-        # --- Show ALL expiries ---
         display_expiries = all_expiry_dates 
         
         col1, col2 = st.columns([1, 3])
@@ -256,7 +283,13 @@ if angel:
         if not is_market_open:
             st.info("This is expected as the market is closed. Expiry dates may be unavailable.")
     
-# --- REMOVED BACKTESTING SECTION ---
+# --- Use streamlit-autorefresh for UI only---
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=UI_REFRESH_SECONDS * 1000, limit=None, key="ui_refresh")
+except ImportError:
+    if st.button("🔄 Refresh Dashboard"):
+        st.rerun()
 
 # ---------------------------
 # Backtesting Section - UPDATED
@@ -341,7 +374,7 @@ elif sl_method_choice == "ATR":
 
 
 # Run Backtest
-if st.button("🚀 RUN INTRADAY BACKTEST", use_container_width=True, type="primary"):
+if st.button("🚀 RUN INTRADAY BACKTEST", width='stretch', type="primary"):
     with st.spinner(f"Fetching {backtest_period} of real {backtest_interval} data..."):
         try:
             # --- RE-ADDED initial_capital to the engine ---
@@ -405,5 +438,5 @@ if 'backtest_result' in st.session_state:
         ]
         display_columns = [col for col in display_columns if col in all_trades.columns]
         
-        st.dataframe(all_trades[display_columns], use_container_width=True, height=400)
+        st.dataframe(all_trades[display_columns], width="stretch", height=400)
     else: st.info("No trades were executed during this backtest period.")
