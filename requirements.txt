@@ -10,3 +10,6 @@ uvicorn
 smartapi-python
 pyotp
 plotly>=5.0.0
+yfinance
+streamlit-autorefresh
+streamlit
