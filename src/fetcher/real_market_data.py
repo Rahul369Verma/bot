@@ -43,7 +43,8 @@ class RealMarketData:
             if not data.empty:
                 return float(data['Close'].iloc[-1])
             
-            data = ticker.history(period="5d", interval="1d") # Fallback for market close
+            # Fallback for market close: get last day's close
+            data = ticker.history(period="5d", interval="1d")
             if not data.empty:
                 return float(data['Close'].iloc[-1])
                 
@@ -69,14 +70,17 @@ class RealMarketData:
                 return {'ema_9': 0, 'ema_15': 0, 'current_price': 0}
                 
             df_ema = data.copy()
+            # --- FIX: Apply timezone logic before calculating ---
             if df_ema.index.tz is None:
-                try: df_ema.index = df_ema.index.tz_localize('UTC')
-                except Exception: pass
-            try: df_ema.index = df_ema.index.tz_convert('Asia/Kolkata')
-            except Exception: pass
+                try: df_ema.index = df_ema.index.tz_localize('Asia/Kolkata') # yfinance data is naive but represents IST
+                except Exception: pass # Already localized
+            else:
+                try: df_ema.index = df_ema.index.tz_convert('Asia/Kolkata')
+                except Exception: pass # Already IST
             
             df_ema = df_ema.between_time('09:15', '15:30')
             df_ema.index = df_ema.index.tz_localize(None) # Make naive IST
+            # --- END FIX ---
             
             if df_ema.empty: 
                  return {'ema_9': 0, 'ema_15': 0, 'current_price': 0}
@@ -101,8 +105,7 @@ class RealMarketData:
             return response.json()
         except Exception as e:
             print(f"❌ Failed to fetch from NSE API: {e}")
-            # Try to re-initialize session if it failed
-            self._setup_session()
+            self._setup_session() # Re-init session
             response = self.session.get(api_url, timeout=10)
             response.raise_for_status()
             return response.json()
@@ -117,7 +120,23 @@ class RealMarketData:
             return expirations
             
         except Exception as e:
-            raise Exception(f"Failed to get expiry dates from NSE: {e}")
+            # --- Fallback for when market is closed (Generates TUESDAYS) ---
+            print(f"Warning: Failed to fetch expiries from yfinance ({e}). Generating fallback dates.")
+            expirations = []
+            today = datetime.now()
+            # Find the next Tuesday (weekday 1)
+            days_ahead = (1 - today.weekday() + 7) % 7
+            if days_ahead == 0 and today.weekday() == 1:
+                days_ahead = 7 # If today is Tue, get next Tue
+            
+            next_expiry = today + timedelta(days=days_ahead)
+            
+            # Add the next 4 expiries
+            for i in range(4):
+                # Format as dd-MMM-YYYY (e.g., 04-Nov-2025) to match NSE
+                expirations.append((next_expiry + timedelta(days=7*i)).strftime("%d-%b-%Y"))
+            
+            return expirations
 
     def get_banknifty_option_chain(self, expiry_date: str) -> List[Dict[str, Any]]:
         """
@@ -127,19 +146,20 @@ class RealMarketData:
             data = self._fetch_nse_option_data()
             option_chain = []
             
-            # Find the strike price of the underlying
-            underlying_price = data.get('records', {}).get('underlyingValue', 0)
-
             for item in data.get('records', {}).get('data', []):
                 # Filter for the specific expiry date
                 if item['expiryDate'] != expiry_date:
                     continue
                 
+                # --- FIX: Create tradingsymbol in ddMMMyy format ---
+                expiry_dt = datetime.strptime(item['expiryDate'], "%d-%b-%Y")
+                expiry_str = expiry_dt.strftime("%d%b%y").upper() # e.g., 04NOV25
+                
                 # Process CALL options
                 if 'CE' in item:
                     ce = item['CE']
                     option_chain.append({
-                        "tradingsymbol": ce['underlying'] + ce['expiryDate'].replace('-', '')[2:] + str(ce['strikePrice']) + "CE",
+                        "tradingsymbol": f"BANKNIFTY{expiry_str}{int(ce['strikePrice'])}CE",
                         "strike": float(ce['strikePrice']), "type": "CE", "expiry": ce['expiryDate'],
                         "ltp": float(ce.get('lastPrice', 0)), "oi": float(ce.get('openInterest', 0)),
                         "volume": float(ce.get('totalTradedVolume', 0)), "iv": float(ce.get('impliedVolatility', 0)),
@@ -150,7 +170,7 @@ class RealMarketData:
                 if 'PE' in item:
                     pe = item['PE']
                     option_chain.append({
-                        "tradingsymbol": pe['underlying'] + pe['expiryDate'].replace('-', '')[2:] + str(pe['strikePrice']) + "PE",
+                        "tradingsymbol": f"BANKNIFTY{expiry_str}{int(pe['strikePrice'])}PE",
                         "strike": float(pe['strikePrice']), "type": "PE", "expiry": pe['expiryDate'],
                         "ltp": float(pe.get('lastPrice', 0)), "oi": float(pe.get('openInterest', 0)),
                         "volume": float(pe.get('totalTradedVolume', 0)), "iv": float(pe.get('impliedVolatility', 0)),

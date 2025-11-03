@@ -3,7 +3,7 @@ import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import pyotp
-import pandas as pd # Import pandas
+import pandas as pd 
 
 try:
     from SmartApi import SmartConnect as SmartClient
@@ -21,47 +21,33 @@ class AngelClient:
     and REALISTIC intraday trading rules.
     """
     def __init__(self, api_key=None, paper=True):
+        # ... (init logic is the same) ...
         self.paper = paper
         self.api_key = api_key or os.getenv("ANGEL_API_KEY")
         self.client_code = os.getenv("ANGEL_CLIENT_CODE")
-        
         self.market_data = RealMarketData()
         self.market_analyzer = MarketAnalyzer()
         self.signal_storage = SignalStorage()
-        
         self.api = None
         self.session_active = False
-        
-        # ... (real login code remains commented out) ...
-
         if self.paper:
             print("✅ Angel Client initialized in PAPER TRADING mode.")
-
-        # --- UPDATED: Realistic Trading State ---
-        self.lot_size = 35 # BankNifty Lot Size
+        self.lot_size = 35 
         self.min_investment = 10000
-        self.simulated_premium_pct = 0.008 # 0.8% of index
-        self.assumed_delta = 0.5 # Assumed option delta for ATM
-        
-        # --- NEW: Set ATR as default SL/TP logic ---
+        self.simulated_premium_pct = 0.008 
+        self.assumed_delta = 0.5 
         self.sl_mode = "ATR"
-        self.atr_sl_multiplier = 0.5
-        self.atr_tp_multiplier = 2.0
-        
-        # Fallback values for "Invested Value" mode
-        self.sl_pct = 0.05 # 5% Stop Loss
-        self.tp_ratio = 2.0  # 2x TP
-        # --- END NEW ---
-        
-        self.daily_sl_count = 0
+        self.atr_sl_multiplier = 1.0  
+        self.atr_tp_multiplier = 2.0  
+        self.sl_pct = 0.05 
+        self.tp_ratio = 2.0  
+        self.max_daily_loss = 2000 
         self.skip_today = False
         self.current_day_checked = None
-
         self.positions_map = {}
         self.orders = []
         self.trade_history = [] 
-        self.daily_pnl = 0.0
-        
+        self.daily_pnl = 0.0 
         self.signal_check_interval = 30 
 
     def check_new_day(self):
@@ -70,8 +56,13 @@ class AngelClient:
         if self.current_day_checked != today:
             print(f"--- New Trading Day ({today}). Resetting daily rules. ---")
             self.current_day_checked = today
-            self.daily_sl_count = 0
+            self.daily_pnl = 0.0 
             self.skip_today = False
+
+    def set_trading_parameters(self, max_daily_loss=None):
+        # ... (no change) ...
+        if max_daily_loss is not None:
+            self.max_daily_loss = max_daily_loss
 
     # ----------- Market Data Methods -----------
     
@@ -80,8 +71,7 @@ class AngelClient:
         try:
             return self.market_data.get_banknifty_historical(days=7)
         except Exception as e:
-            print(f"Error getting 5m data: {e}")
-            return pd.DataFrame()
+            print(f"Error getting 5m data: {e}"); return pd.DataFrame()
 
     def get_index_ltp(self, symbol: str = "BANKNIFTY") -> float:
         # ... (no change) ...
@@ -108,12 +98,10 @@ class AngelClient:
         try:
             chain = self.get_option_chain(expiry=expiry_hint)
             for item in chain:
-                if item['tradingsymbol'] == tradingsymbol:
-                    return float(item['ltp'])
+                if item['tradingsymbol'] == tradingsymbol: return float(item['ltp'])
             chain = self.get_option_chain(expiry="")
             for item in chain:
-                if item['tradingsymbol'] == tradingsymbol:
-                    return float(item['ltp'])
+                if item['tradingsymbol'] == tradingsymbol: return float(item['ltp'])
             raise Exception(f"Option {tradingsymbol} not found in any chain")
         except Exception as e:
             raise Exception(f"Failed to get option LTP: {e}")
@@ -123,7 +111,8 @@ class AngelClient:
     def generate_continuous_signals(self) -> List[Dict[str, Any]]:
         # ... (no change) ...
         if self.skip_today: return []
-        if self.daily_sl_count >= 2: return []
+        if self.daily_pnl <= -abs(self.max_daily_loss): 
+            return [] 
         if len(self.positions_map) > 0: return []
         try:
             historical_data = self.get_5m_historical_data()
@@ -144,81 +133,68 @@ class AngelClient:
             print(f"❌ Error in signal generation loop: {e}")
             return []
             
-    # --- UPDATED execute_strategy_trade ---
     def execute_strategy_trade(self, signal: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Executes a trade based on the new rules (1 Lot, >10k, etc.)
-        and uses the default SL/TP logic (ATR).
-        """
+        # ... (no change) ...
         try:
             expiry_dates = self.get_expiry_dates()
             if not expiry_dates:
                 return {"status": False, "message": "No expiry dates available"}
-            
             expiry = expiry_dates[0] 
-            strike = signal.get("strike")
-            option_type = signal.get("type")
-            
-            # Use the correct date format from NSE (e.g., 04-Nov-2025 -> 04NOV25)
-            expiry_dt = datetime.strptime(expiry, "%d-%b-%Y") # NSE format is dd-MMM-YYYY
+            strike = signal.get("strike"); option_type = signal.get("type")
+            expiry_dt = datetime.strptime(expiry, "%d-%b-%Y") 
             expiry_str = expiry_dt.strftime("%d%b%y").upper()
-            
             tradingsymbol = f"BANKNIFTY{expiry_str}{strike}{option_type}"
-            
-            # --- 1 Lot > 10k Rule ---
             option_ltp = self.get_option_ltp(tradingsymbol, expiry_hint=expiry)
-            
             cost_of_one_lot = option_ltp * self.lot_size
-            
             if cost_of_one_lot < self.min_investment:
                 self.skip_today = True 
                 return {"status": False, "message": f"SKIP DAY: Lot cost ₹{cost_of_one_lot:,.0f} < ₹{self.min_investment:,.0f}"}
-
-            quantity = self.lot_size # Always 1 lot
-            
-            # --- NEW: SL/TP Calculation (ATR Mode) ---
+            quantity = self.lot_size 
             if self.sl_mode == "ATR":
                 current_atr = signal.get('atr')
-                if not current_atr:
-                    raise Exception("Signal did not contain 'atr' value. Cannot use ATR stop loss.")
-                
-                # 1. Calculate Index SL/TP in points
-                index_sl_points = current_atr * self.atr_sl_multiplier
-                index_tp_points = current_atr * self.atr_tp_multiplier
-                
-                # 2. Convert to Option SL/TP using Delta
-                option_sl_points = index_sl_points * self.assumed_delta
-                option_tp_points = index_tp_points * self.assumed_delta
-                
-                # 3. Calculate final prices
-                stop_loss_price = round(option_ltp - option_sl_points, 1)
-                take_profit_price = round(option_ltp + option_tp_points, 1)
-                
-            else: # Fallback to "Invested Value"
-                sl_amount_total = cost_of_one_lot * self.sl_pct
-                tp_amount_total = sl_amount_total * self.tp_ratio
-                sl_points = sl_amount_total / quantity
-                tp_points = tp_amount_total / quantity
-                
-                stop_loss_price = round(option_ltp - sl_points, 1)
-                take_profit_price = round(option_ltp + tp_points, 1)
-            # --- END SL/TP CALC ---
-
-            # --- Place the real/paper order ---
+                if not current_atr: raise Exception("Signal did not contain 'atr' value.")
+                index_sl_points = current_atr * self.atr_sl_multiplier; index_tp_points = current_atr * self.atr_tp_multiplier
+                option_sl_points = index_sl_points * self.assumed_delta; option_tp_points = index_tp_points * self.assumed_delta
+                stop_loss_price = round(option_ltp - option_sl_points, 1); take_profit_price = round(option_ltp + option_tp_points, 1)
+            else: 
+                sl_amount_total = cost_of_one_lot * self.sl_pct; tp_amount_total = sl_amount_total * self.tp_ratio
+                sl_points = sl_amount_total / quantity; tp_points = tp_amount_total / quantity
+                stop_loss_price = round(option_ltp - sl_points, 1); take_profit_price = round(option_ltp + tp_points, 1)
             result = self.place_order(
-                tradingsymbol=tradingsymbol,
-                transaction_type="BUY",
-                quantity=quantity,
-                price=option_ltp,
-                stop_loss=stop_loss_price,
-                take_profit=take_profit_price,
-                expiry=expiry # Pass expiry for storage
+                tradingsymbol=tradingsymbol, transaction_type="BUY", quantity=quantity,
+                price=option_ltp, stop_loss=stop_loss_price, take_profit=take_profit_price,
+                expiry=expiry 
             )
-            
             return result
-            
         except Exception as e:
             return {"status": False, "message": f"Strategy execution failed: {e}"}
+
+    def execute_manual_test_trade(self, signal_type: str) -> Dict[str, Any]:
+        # ... (no change) ...
+        print(f"--- Received Manual Test Signal: {signal_type} ---")
+        if len(self.positions_map) > 0:
+            return {"status": False, "message": "Bot is already in a position."}
+        if self.skip_today: 
+            return {"status": False, "message": "SKIPPED: Lot cost was < ₹10k earlier today."}
+        if self.daily_pnl <= -abs(self.max_daily_loss): 
+            return {"status": False, "message": f"STOPPED: Max daily loss of ₹{self.max_daily_loss} was hit."}
+        try:
+            spot_price = self.get_index_ltp()
+            historical_data = self.get_5m_historical_data()
+            hist_df = self.market_analyzer.calculate_indicators(historical_data)
+            if hist_df is None or hist_df.empty:
+                return {"status": False, "message": "Could not calculate indicators for ATR."}
+            current_atr = hist_df.iloc[-1]['atr']
+            strike = int(round(spot_price / 100.0) * 100)
+            fake_signal = {
+                "signal": "BUY", "type": signal_type, "price": spot_price,
+                "strike": strike, "reason": f"MANUAL TEST SIGNAL ({signal_type})",
+                "atr": current_atr
+            }
+            return self.execute_strategy_trade(fake_signal)
+        except Exception as e:
+            return {"status": False, "message": f"Manual trade failed: {e}"}
+    
             
     def check_and_close_positions(self):
         # ... (no change) ...
@@ -234,20 +210,73 @@ class AngelClient:
                     reason = "STOP_LOSS" if sl_hit else "TAKE_PROFIT"
                     print(f"🔥 {reason} HIT for {symbol} at LTP {ltp} (SL: {sl_price}, TP: {tp_price})")
                     result = self.place_order(tradingsymbol=symbol, transaction_type="SELL", quantity=pos['qty'], price=ltp, is_exit=True)
-                    if sl_hit:
-                        self.daily_sl_count += 1
-                        print(f"🛑 Daily SL Count: {self.daily_sl_count}")
-                        if self.daily_sl_count >= 2:
-                            print("--- 2 STOP LOSSES HIT. STOPPING TRADING FOR THE DAY. ---")
+                    if sl_hit and self.daily_pnl <= -abs(self.max_daily_loss):
+                        print(f"--- MAX DAILY LOSS (₹{self.max_daily_loss}) HIT. STOPPING TRADING FOR THE DAY. ---")
             except Exception as e:
                 print(f"❌ Error checking position {symbol} (Market may be closed): {e}")
+
+    # --- NEW: Close All Positions Function ---
+    def close_all_live_positions(self) -> Dict[str, Any]:
+        """
+        Manually closes all open paper positions at their current live price.
+        """
+        print("--- MANUAL: Received request to CLOSE ALL POSITIONS ---")
+        results = []
+        total_pnl = 0
+        
+        symbols_to_close = list(self.positions_map.keys()) 
+        
+        if not symbols_to_close:
+            return {"status": "info", "message": "No open positions to close."}
+
+        for symbol in symbols_to_close:
+            try:
+                pos = self.positions_map.get(symbol)
+                if not pos:
+                    continue # Already closed
+                
+                expiry_hint = pos.get('expiry')
+                quantity = pos.get('qty')
+                
+                # 1. Get live price
+                ltp = self.get_option_ltp(symbol, expiry_hint=expiry_hint)
+                
+                # 2. Call place_order to handle closing logic
+                result = self.place_order(
+                    tradingsymbol=symbol,
+                    transaction_type="SELL",
+                    quantity=quantity,
+                    price=ltp,
+                    is_exit=True
+                )
+                
+                if result.get('status'):
+                    print(f"✅ Manually closed {symbol}")
+                    if result.get('trade_pnl') is not None:
+                        total_pnl += result['trade_pnl']
+                    results.append(result)
+                else:
+                    print(f"❌ Failed to manually close {symbol}: {result.get('message')}")
+                    results.append(result)
+                    
+            except Exception as e:
+                print(f"❌ CRITICAL ERROR closing {symbol}: {e}")
+                results.append({"status": False, "message": f"Error closing {symbol}: {e}"})
+
+        return {
+            "status": "success",
+            "message": f"Closed {len(symbols_to_close)} position(s).",
+            "total_pnl": total_pnl,
+            "results": results
+        }
+    # --- END NEW FUNCTION ---
 
     # ----------- Paper/Real Trading Methods -----------
     def place_order(self, tradingsymbol: str, transaction_type: str, quantity: int, 
                     price: Optional[float] = None, 
                     stop_loss: Optional[float] = None, 
                     take_profit: Optional[float] = None,
-                    expiry: Optional[str] = None, # Added expiry
+                    expiry: Optional[str] = None, 
                     is_exit: bool = False) -> Dict[str, Any]:
         # ... (no change) ...
         transaction_type = transaction_type.upper()
@@ -259,17 +288,17 @@ class AngelClient:
                 if is_exit or transaction_type == "SELL":
                     if tradingsymbol not in self.positions_map:
                         return {"status": False, "message": "Position not found"}
-                    entry_pos = self.positions_map.pop(tradingsymbol) # Close position
+                    entry_pos = self.positions_map.pop(tradingsymbol) 
                     pnl = (price - entry_pos['avg_price']) * quantity
-                    self.daily_pnl += pnl
+                    self.daily_pnl += pnl 
                     trade_record = {"timestamp": time.time(), "tradingsymbol": tradingsymbol, "transaction_type": "SELL", "quantity": quantity, "price": price, "pnl": pnl, "order_id": order_id}
                     self.trade_history.append(trade_record)
                     return {"status": True, "message": f"PAPER SELL {quantity} {tradingsymbol} @ {price}", "orderId": order_id, "data": trade_record, "trade_pnl": pnl}
-                else: # This is a BUY (entry) order
+                else: 
                     self.positions_map[tradingsymbol] = {
                         "qty": quantity, "avg_price": price,
                         "stop_loss": stop_loss, "take_profit": take_profit,
-                        "expiry": expiry # Store the expiry
+                        "expiry": expiry 
                     }
                     order_record = {"timestamp": time.time(), "tradingsymbol": tradingsymbol, "transaction_type": "BUY", "quantity": quantity, "price": price, "status": order_status, "order_id": order_id}
                     self.orders.append(order_record)
@@ -277,11 +306,12 @@ class AngelClient:
             except Exception as e:
                 return {"status": False, "message": f"Paper order failed: {e}"}
         else:
-            # --- REAL ANGEL ONE TRADING LOGIC ---
-            pass
+            print("--- REAL TRADING IS NOT IMPLEMENTED ---")
+            return {"status": False, "message": "Real trading logic is not implemented."}
 
     # ... (rest of helper functions: get_positions, get_trade_history, etc.) ...
     def get_positions(self) -> List[Dict[str, Any]]:
+        # ... (no change) ...
         positions = []
         for symbol, pos in self.positions_map.items():
             try:
@@ -293,6 +323,7 @@ class AngelClient:
     def get_trade_history(self) -> List[Dict[str, Any]]: return self.trade_history
     def get_daily_pnl(self) -> float: return self.daily_pnl
     def get_portfolio_value(self) -> Dict[str, float]:
+        # ... (no change) ...
         positions = self.get_positions()
         total_investment = sum(pos['avg_price'] * abs(pos['qty']) for pos in positions)
         total_current = sum(pos['current_price'] * abs(pos['qty']) for pos in positions)

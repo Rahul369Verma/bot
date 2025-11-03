@@ -2,7 +2,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta, time as dt_time # Renamed to avoid conflict
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo # Import ZoneInfo
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -16,67 +16,48 @@ project_root = os.path.dirname(src_dir)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 # --- END FIX ---
-from src.fetcher.angel_client import AngelClient
-from src.backtest.backtest import StrategyTester, CUSTOM_STRATEGY_TEMPLATE # No longer needed
+
+from src.fetcher.angel_client import AngelClient 
+from src.backtest.backtest import StrategyTester 
+
 
 # ---------------------------
 # Load environment variables
 # ---------------------------
 load_dotenv()
 UNDERLYING = "BANKNIFTY"
-# --- UPDATED: Bot logic will now run every 30s ---
 BOT_HEARTBEAT_SECONDS = 30
-UI_REFRESH_SECONDS = 15
+UI_REFRESH_SECONDS = 10     
 IST = ZoneInfo('Asia/Kolkata') 
 
 # ---------------------------
 # The Bot's "Heartbeat" Loop
 # ---------------------------
 def bot_loop(client: AngelClient):
-    """
-    This function runs in a separate, persistent background thread.
-    It is the "brain" of your bot.
-    """
+    # ... (no change) ...
     print("✅ Bot background thread started. Waiting for the next 30-second mark to align...")
     while True:
         try:
-            # --- NEW: Self-Correcting 30-Second Alignment ---
-            # This loop will always wake up on the :00 or :30 of a minute
             current_time = time.time()
-            # Calculate how many seconds to wait to hit the next 30-second mark
             seconds_to_wait = BOT_HEARTBEAT_SECONDS - (current_time % BOT_HEARTBEAT_SECONDS)
-            
-            # Sleep for that precise duration
             time.sleep(seconds_to_wait)
-            # --- END NEW ---
-
             now_ist = datetime.now(IST)
             is_market_open = (now_ist.weekday() < 5) and (dt_time(9, 15) <= now_ist.time() <= dt_time(15, 30))
-
-            # Print heartbeat to the TERMINAL
-            # This will now always show :00 or :30
             print(f"[{now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}] Bot Heartbeat. Market Open: {is_market_open}")
-
             if is_market_open:
-                # Only run trading logic if market is open
                 client.check_new_day()
                 client.check_and_close_positions()
                 signals = client.generate_continuous_signals()
-            
-            # The main sleep is now at the top of the loop
-
         except Exception as e:
             print(f"❌ CRITICAL ERROR in bot_loop: {e}")
-            time.sleep(5) # Wait 5s before retrying after an error
+            time.sleep(5) 
 
 # ---------------------------
 # Initialize Angel Client
 # ---------------------------
 @st.cache_resource
 def init_angel_client():
-    """
-    Initialize the Angel Client. This runs only ONCE.
-    """
+    # ... (no change) ...
     try:
         client = AngelClient(paper=True)
         return client
@@ -89,11 +70,10 @@ angel = init_angel_client()
 # ---------------------------
 # Start the Bot Thread (Runs Once)
 # ---------------------------
+# ... (no change) ...
 if 'bot_thread_running' not in st.session_state:
     if angel:
         print("Starting bot background thread...")
-        # Start the bot_loop function in a new thread
-        # daemon=True means the thread will close when the main app stops
         t = threading.Thread(target=bot_loop, args=(angel,), daemon=True)
         t.start()
         st.session_state['bot_thread_running'] = True
@@ -104,6 +84,7 @@ if 'bot_thread_running' not in st.session_state:
 # ---------------------------
 # Helper functions
 # ---------------------------
+# ... (no change: safe_dataframe_formatting, format_volume, highlight_atm) ...
 def safe_dataframe_formatting(df, columns_format):
     df_formatted = df.copy()
     for col, format_func in columns_format.items():
@@ -134,50 +115,41 @@ if angel.paper:
 else:
     st.error("WARNING: Bot is in REAL MONEY mode. Real trades will be placed.")
 
-# Check market hours
 now_ist = datetime.now(IST)
 is_market_open = (now_ist.weekday() < 5) and (dt_time(9, 15) <= now_ist.time() <= dt_time(15, 30))
 
 # ---------------------------
 # Bot Status Dashboard
 # ---------------------------
+# ... (no change) ...
 st.subheader("🤖 Bot Status & Rules")
 if angel:
-    daily_trend = angel.market_analyzer.daily_trend
-    sl_count = angel.daily_sl_count
+    st.write("Using **ATR** for SL/TP (SL: 1.0x, TP: 2.0x)")
+    max_loss_input = st.number_input("Max Daily Loss (₹)", value=2000, min_value=100, step=100,
+                                     help="Bot will stop trading for the day if Today's Realized P&L hits this level.")
+    angel.set_trading_parameters(max_daily_loss=max_loss_input)
+    daily_pnl = angel.daily_pnl 
     skip_day = angel.skip_today
-
-    scol1, scol2, scol3 = st.columns(3)
-    with scol1:
-        st.metric("Daily Trend", daily_trend)
+    scol1, scol2 = st.columns(2)
+    with scol1: st.metric("Today's Realized P&L", f"₹{daily_pnl:,.2f}")
     with scol2:
-        st.metric("Stop Losses Hit Today", f"{sl_count} / 2")
-    with scol3:
-        if not is_market_open:
-            st.info("MARKET CLOSED")
-        elif sl_count >= 2:
-            st.error("STOPPED: 2 SL hits.")
-        elif skip_day:
-            st.warning("SKIPPED: Lot cost < ₹10k.")
-        elif len(angel.positions_map) > 0:
-            st.success("POSITION OPEN")
-        else:
-            st.success("MONITORING...")
+        if not is_market_open: st.info("MARKET CLOSED")
+        elif daily_pnl <= -abs(max_loss_input): st.error(f"STOPPED: Max loss of ₹{max_loss_input} hit.")
+        elif skip_day: st.warning("SKIPPED: Lot cost < ₹10k.")
+        elif len(angel.positions_map) > 0: st.success("POSITION OPEN")
+        else: st.success("MONITORING (MTA Strategy)")
 
 # ---------------------------
 # Market Data Section
 # ---------------------------
+# ... (no changes) ...
 st.subheader("📊 Live Market Data")
-
-if not is_market_open:
-    st.warning("Market is CLOSED. Live data (LTP, OI, IV) will be unavailable or show last 'close' price.")
-
+if not is_market_open: st.warning("Market is CLOSED. Live data (LTP, OI, IV) will be unavailable or show last 'close' price.")
 spot_price = 0.0 
 if angel:
     try:
         spot_price = angel.get_index_ltp("BANKNIFTY")
         ema_data = angel.market_data.calculate_emas(angel.get_5m_historical_data())
-        
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1: st.metric(f"{UNDERLYING} Spot", f"₹{spot_price:,.2f}")
         with col2: st.metric("5m EMA 9", f"₹{ema_data['ema_9']:,.2f}")
@@ -186,11 +158,9 @@ if angel:
             ema_diff = ema_data['ema_9'] - ema_data['ema_15']; trend = "BULLISH" if ema_diff > 0 else "BEARISH"
             st.metric("5m Trend", trend, delta=f"₹{ema_diff:,.2f}")
         with col5: st.metric("Last Update (IST)", now_ist.strftime("%H:%M:%S"))
-        
     except Exception as e:
         st.error(f"❌ Failed to load market data: {e}")
-        if not is_market_open:
-            st.info("This is expected as the market is closed.")
+        if not is_market_open: st.info("This is expected as the market is closed.")
 
 
 # ---------------------------
@@ -205,55 +175,86 @@ if angel:
         col1, col2, col3 = st.columns(3)
         with col1: st.metric("Total Investment", f"₹{portfolio['total_investment']:,.2f}")
         with col2: st.metric("Current Value", f"₹{portfolio['total_current_value']:,.2f}")
-        with col3: st.metric("Unrealized P&L", f"₹{portfolio['total_unrealized_pnl']:,.2f}", 
-                       delta=f"{portfolio['total_unrealized_pnl']:,.2f}")
+        with col3: st.metric("Unrealized P&L", f"₹{portfolio['total_unrealized_pnl']:,.2f}", delta=f"{portfolio['total_unrealized_pnl']:,.2f}")
         st.metric("Today's Realized P&L", f"₹{portfolio['daily_realized_pnl']:,.2f}")
         
+        # --- NEW: Close All Positions Button ---
+        if st.button("🚨 CLOSE ALL OPEN POSITIONS 🚨", type="primary", use_container_width=True):
+            if angel and len(angel.positions_map) > 0:
+                with st.spinner("Closing all positions..."):
+                    close_results = angel.close_all_live_positions()
+                    
+                    for res in close_results.get('results', []):
+                        if res.get('status'):
+                            pnl = res.get('trade_pnl', 0)
+                            color = "green" if pnl >= 0 else "red"
+                            st.success(f"Closed {res['data']['tradingsymbol']} for P&L: ₹{pnl:,.2f}")
+                        else:
+                            st.error(f"Failed to close position: {res.get('message')}")
+                    
+                    st.info(f"Total P&L from closing: ₹{close_results.get('total_pnl', 0):,.2f}")
+                    # No rerun needed, UI will refresh in 10s
+            else:
+                st.info("No open positions to close.")
+        # --- END NEW ---
+        
         if positions:
-            st.write("**Current Open Positions**")
-            df_positions = pd.DataFrame(positions)
-            st.dataframe(df_positions[['tradingsymbol', 'qty', 'avg_price', 'current_price', 'unrealized_pnl', 'sl', 'tp']], 
-                        width='stretch')
+            st.write("**Current Open Positions**"); df_positions = pd.DataFrame(positions)
+            st.dataframe(df_positions[['tradingsymbol', 'qty', 'avg_price', 'current_price', 'unrealized_pnl', 'sl', 'tp']], width='stretch')
         else: st.info("No open positions.")
         
         trade_history = angel.get_trade_history()
         if trade_history:
-            st.write("**Today's Closed Trades**")
-            df_history = pd.DataFrame(trade_history)
+            st.write("**Today's Closed Trades**"); df_history = pd.DataFrame(trade_history)
             df_history['time'] = pd.to_datetime(df_history['timestamp'], unit='s').dt.strftime('%H:%M:%S')
             st.dataframe(df_history[['time', 'tradingsymbol', 'quantity', 'price', 'pnl']], width='stretch')
+    except Exception as e: st.error(f"❌ Paper trading error: {e}")
 
-    except Exception as e:
-        st.error(f"❌ Paper trading error: {e}")
+# --- NEW: Manual Trade Testing Section ---
+st.subheader("🛠️ Manual Trade Testing")
+st.write("Test the paper trading system by firing a fake signal. This uses the *current market price* and applies all bot rules (10k, ATR SL/TP, etc.)")
+
+mcol1, mcol2 = st.columns(2)
+with mcol1:
+    if st.button("📈 Test FAKE BUY (CE) Signal"):
+        if angel:
+            with st.spinner("Attempting fake BUY..."):
+                result = angel.execute_manual_test_trade(signal_type='CE')
+                if result.get('status'):
+                    st.success(f"✅ {result.get('message')}")
+                else:
+                    st.error(f"❌ {result.get('message')}")
+with mcol2:
+    if st.button("📉 Test FAKE SELL (PE) Signal"):
+        if angel:
+            with st.spinner("Attempting fake SELL..."):
+                result = angel.execute_manual_test_trade(signal_type='PE')
+                if result.get('status'):
+                    st.success(f"✅ {result.get('message')}")
+                else:
+                    st.error(f"❌ {result.get('message')}")
+# --- END NEW SECTION ---
 
 # ---------------------------
 # Real Option Chain Section
 # ---------------------------
+# ... (no changes) ...
 st.subheader("📋 Real Option Chain")
 if angel:
     try:
-        all_expiry_dates = angel.get_expiry_dates()
-        display_expiries = all_expiry_dates 
-        
+        all_expiry_dates = angel.get_expiry_dates(); display_expiries = all_expiry_dates 
         col1, col2 = st.columns([1, 3])
         with col1:
-            if display_expiries:
-                expiry = st.selectbox("Select Expiry", display_expiries, index=0)
-                st.caption(f"Selected: {expiry}")
-            else:
-                st.error("No expiry dates available")
-                expiry = None
-        
+            if display_expiries: expiry = st.selectbox("Select Expiry", display_expiries, index=0); st.caption(f"Selected: {expiry}")
+            else: st.error("No expiry dates available"); expiry = None
         if expiry and spot_price > 0:
             atm_strike = int(round(spot_price / 100.0) * 100)
             option_chain = angel.get_option_chain(expiry=expiry)
-            
             if option_chain:
                 st.success(f"✅ Loaded {len(option_chain)} options for {expiry} (Data is from last close)")
                 df_chain = pd.DataFrame(option_chain)
                 atm_options = df_chain[(df_chain['strike'] >= atm_strike - 300) & (df_chain['strike'] <= atm_strike + 300)].sort_values('strike')
-                ce_chain = atm_options[atm_options['type'] == 'CE']
-                pe_chain = atm_options[atm_options['type'] == 'PE']
+                ce_chain = atm_options[atm_options['type'] == 'CE']; pe_chain = atm_options[atm_options['type'] == 'PE']
                 col1, col2 = st.columns(2)
                 with col1:
                     st.write(f"**📈 CALL Options (ATM: ₹{atm_strike})**")
@@ -272,17 +273,98 @@ if angel:
                         display_pe_styled = display_pe.style.apply(highlight_atm, atm_strike=atm_strike, axis=1)
                         st.dataframe(display_pe_styled, width='stretch')
                     else: st.info("No PUT options available")
-                total_oi_call = ce_chain['oi'].sum() if not ce_chain.empty else 0
-                total_oi_put = pe_chain['oi'].sum() if not pe_chain.empty else 0
+                total_oi_call = ce_chain['oi'].sum() if not ce_chain.empty else 0; total_oi_put = pe_chain['oi'].sum() if not pe_chain.empty else 0
                 pcr = total_oi_put / total_oi_call if total_oi_call > 0 else 0
                 st.metric("Put-Call Ratio (PCR)", f"{pcr:.2f}")
-            else:
-                st.error("❌ No option chain data available for selected expiry")
+            else: st.error("❌ No option chain data available for selected expiry")
     except Exception as e:
         st.error(f"❌ Failed to load option chain: {e}")
-        if not is_market_open:
-            st.info("This is expected as the market is closed. Expiry dates may be unavailable.")
+        if not is_market_open: st.info("This is expected as the market is closed. Expiry dates may be unavailable.")
     
+# ---------------------------
+# Backtesting Section
+# ---------------------------
+# ... (no changes) ...
+st.markdown("---")
+st.subheader("🧪 Multi-Timeframe (5m/15m/1h) Backtest") 
+if 'strategy_tester' not in st.session_state:
+    try:
+        st.session_state.strategy_tester = StrategyTester()
+    except Exception as e:
+         st.error(f"Failed to initialize StrategyTester: {e}")
+         st.session_state.strategy_tester = None
+if st.session_state.strategy_tester:
+    tester = st.session_state.strategy_tester
+    st.warning("""
+    **⚠️ REALISTIC INTRADAY BACKTEST (5m Data)**
+    1.  **Data Source**: Uses **real 5m historical data** from `yfinance` (Max 60 days).
+    2.  **Strategy**: Trades 5m crossover **only if** 15m and 1h EMA trends align.
+    3.  **Sizing**: Trades **1 Lot (35 Units)** *only if* the simulated cost is **> ₹10,000**.
+    4.  **Risk**: **Stops trading for the day if Max Daily Loss (₹) is hit.**
+    5.  **Trades the Index**: P&L is based on *index points*. "Simulated Option" is for reference.
+    """)
+    backtest_interval = "5m"; st.info(f"Using **{backtest_interval}** data interval for signals (Max 60 days).")
+    period_options = ["1d", "5d", "1mo", "60d"]; default_index = 3 
+    backtest_period = st.selectbox("Test Period (Max 60d)", period_options, index=default_index, key="backtest_period")
+    st.markdown("#### 🛡️ Risk & Sizing")
+    strategy_params = {} 
+    strategy_params['initial_capital'] = st.number_input("Starting Capital (₹)", value=20000, min_value=10000, help="Used for P&L tracking and equity curve. Does not affect trade size.")
+    strategy_params['max_daily_loss'] = st.number_input("Max Daily Loss (₹)", value=2000, min_value=100, step=100, key="bt_max_loss")
+    rcol1, rcol2, rcol3 = st.columns(3)
+    with rcol1: strategy_params['lot_size'] = st.number_input("Lot Size", value=35, min_value=1, help="BankNifty Lot Size (35)", key="bt_lot_size")
+    with rcol2: strategy_params['min_investment'] = st.number_input("Min. Invest (₹)", value=10000, min_value=1000, key="bt_min_invest")
+    with rcol3: strategy_params['simulated_premium_pct'] = st.number_input("Sim. Premium (%)", value=0.8, min_value=0.1, max_value=5.0, step=0.1, format="%.1f", key="bt_sim_prem") / 100.0 
+    sl_method_choice = st.selectbox("Stop-Loss Method", ["Invested Value (%)", "ATR"], index=1, key="bt_sl_mode", help="**Invested Value (%):** SL = % of (Simulated Premium * Quantity). **ATR:** Dynamic SL/TP based on 5m ATR.")
+    strategy_params['sl_mode'] = sl_method_choice
+    if sl_method_choice == "Invested Value (%)":
+        st.info("SL based on % of calculated Invested Value | TP = SL Amount x Multiplier")
+        iv_col1, iv_col2 = st.columns(2)
+        with iv_col1: sl_pct = st.number_input("SL (% of Invested Value)", value=5.0, min_value=0.5, step=0.5, key="bt_sl_pct"); strategy_params['invested_value_sl_pct'] = sl_pct
+        with iv_col2: tp_mult = st.number_input("TP (Multiplier of SL Amount)", value=2.0, min_value=1.0, step=0.5, key="bt_tp_mult"); strategy_params['tp_sl_ratio'] = tp_mult
+    elif sl_method_choice == "ATR":
+        st.info("Using dynamic ATR-based Take Profit and Stop Loss.")
+        atr_col1, atr_col2, atr_col3 = st.columns(3)
+        with atr_col1: strategy_params['atr_period'] = st.number_input("ATR Period", value=30, min_value=1, key="bt_atr_period")
+        with atr_col2: strategy_params['atr_tp_multiplier'] = st.number_input("ATR TP Multiplier", value=2.0, min_value=0.1, step=0.1, format="%.1f", key="bt_atr_tp")
+        with atr_col3: strategy_params['atr_sl_multiplier'] = st.number_input("ATR SL Multiplier", value=1.0, min_value=0.1, step=0.1, format="%.1f", key="bt_atr_sl")
+    if st.button("🚀 RUN INTRADAY BACKTEST", use_container_width=True, type="primary"):
+        with st.spinner(f"Fetching {backtest_period} of real {backtest_interval} data..."):
+            try:
+                tester.engine.initial_capital = strategy_params['initial_capital']
+                result = tester.engine.run_backtest(strategy_name="mta_ema", symbol="BANKNIFTY", period=backtest_period, interval=backtest_interval, **strategy_params)
+                st.session_state.backtest_result = result
+                st.success(f"✅ Backtest completed! {result.total_trades} trades analyzed on REAL 5m data.")
+            except Exception as e:
+                st.error(f"❌ Backtest failed: {e}"); st.exception(e)
+    if 'backtest_result' in st.session_state:
+        result = st.session_state.backtest_result
+        st.markdown("---"); st.subheader("📊 BACKTEST RESULTS (ON REAL 5m DATA)")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1: st.metric("Total P&L", f"₹{result.total_pnl:,.0f}"); st.metric("Win Rate", f"{result.win_rate:.1f}%")
+        with col2: st.metric("Total Trades", result.total_trades); st.metric("Profit Factor", f"{result.profit_factor:.2f}")
+        with col3: st.metric("Max Drawdown", f"{result.max_drawdown:.1f}%"); st.metric("Sharpe Ratio", f"{result.sharpe_ratio:.2f}")
+        with col4: st.metric("Best Trade", f"₹{result.best_trade:,.0f}"); st.metric("Worst Trade", f"₹{result.worst_trade:,.0f}")
+        st.markdown("#### 📈 Portfolio Growth")
+        if result.equity_curve is not None and not result.equity_curve.empty:
+            if isinstance(result.equity_curve.index, pd.DatetimeIndex): chart_data = result.equity_curve['equity']
+            else: st.warning("Equity curve index is not timestamp."); chart_data = result.equity_curve['equity']
+            st.line_chart(chart_data) 
+        else: st.info("No equity data to plot.")
+        if result.trade_details:
+            st.markdown("#### 📋 Full Trade Log")
+            trades_df = pd.DataFrame(result.trade_details)
+            all_trades = trades_df.copy()
+            all_trades['entry_time'] = pd.to_datetime(all_trades['entry_time'], errors='coerce').dt.strftime('%m/%d %H:%M')
+            all_trades['exit_time'] = pd.to_datetime(all_trades['exit_time'], errors='coerce').dt.strftime('%m/%d %H:%M')
+            all_trades['invested_amount_fmt'] = all_trades['invested_amount'].apply(lambda x: f"₹{x:,.0f}" if pd.notna(x) else 'N/A')
+            all_trades['entry_price_fmt'] = all_trades['entry_price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else 'N/A')
+            all_trades['exit_price_fmt'] = all_trades['exit_price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else 'N/A')
+            all_trades['pnl_fmt'] = all_trades['pnl'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else 'N/A')
+            display_columns = ['entry_time', 'simulated_option', 'quantity', 'invested_amount_fmt', 'entry_price_fmt', 'exit_time', 'exit_price_fmt', 'pnl_fmt', 'exit_reason']
+            display_columns = [col for col in all_trades.columns if col in display_columns]
+            st.dataframe(all_trades[display_columns], width='stretch', height=400)
+        else: st.info("No trades were executed during this backtest period.")
+
 # --- Use streamlit-autorefresh for UI only---
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -290,153 +372,3 @@ try:
 except ImportError:
     if st.button("🔄 Refresh Dashboard"):
         st.rerun()
-
-# ---------------------------
-# Backtesting Section - UPDATED
-# ---------------------------
-st.subheader("🧪 5m/15m EMA Daily Trend Strategy") 
-
-if 'strategy_tester' not in st.session_state:
-    try:
-        st.session_state.strategy_tester = StrategyTester()
-    except Exception as e:
-         st.error(f"Failed to initialize StrategyTester: {e}")
-         st.stop()
-
-tester = st.session_state.strategy_tester
-
-st.warning("""
-**⚠️ REALISTIC INTRADAY BACKTEST (5m Data)**
-1.  **Data Source**: Uses **real 5m historical data** from `yfinance` (Max 60 days).
-2.  **Strategy**: Locks in 15m trend for the day, takes 5m alignment signals.
-3.  **Sizing**: Trades **1 Lot (35 Units)** *only if* the simulated cost is **> ₹10,000**.
-4.  **Risk**: **Stops trading for the day after 2 stop-loss hits.**
-5.  **Trades the Index**: P&L is based on *index points*. "Simulated Option" is for reference.
-""")
-
-# --- Configuration ---
-backtest_interval = "5m"
-st.info(f"Using **{backtest_interval}** data interval for signals (Max 60 days).")
-
-period_options = ["1d", "5d", "1mo", "60d"]
-default_index = 3 # "60d"
-backtest_period = st.selectbox(
-    "Test Period (Max 60d)",
-    period_options,
-    index=default_index
-)
-# --- End Configuration ---
-
-# --- UPDATED Risk Management ---
-st.markdown("#### 🛡️ Risk & Sizing")
-strategy_params = {} 
-
-# --- RE-ADDED Starting Capital ---
-strategy_params['initial_capital'] = st.number_input("Starting Capital (₹)", value=100000, min_value=10000, 
-                                                   help="Used for P&L tracking and equity curve. Does not affect trade size.")
-
-# Lot Size & Min Investment
-rcol1, rcol2, rcol3 = st.columns(3)
-with rcol1:
-    strategy_params['lot_size'] = st.number_input("Lot Size", value=35, min_value=1, help="BankNifty Lot Size (35)")
-with rcol2:
-    strategy_params['min_investment'] = st.number_input("Min. Invest (₹)", value=10000, min_value=1000)
-with rcol3:
-    strategy_params['simulated_premium_pct'] = st.number_input("Sim. Premium (%)", value=0.8, min_value=0.1, max_value=5.0, step=0.1, format="%.1f") / 100.0 
-
-# --- RE-ADDED SL Method Choice ---
-sl_method_choice = st.selectbox(
-    "Stop-Loss Method",
-    ["Invested Value (%)", "ATR"], # Give choice
-    index=0,
-    help="**Invested Value (%):** SL = 5% of (Simulated Premium * Quantity). **ATR:** Dynamic SL/TP based on 5m ATR."
-)
-strategy_params['sl_mode'] = sl_method_choice
-
-if sl_method_choice == "Invested Value (%)":
-    st.info("SL based on % of calculated Invested Value | TP = SL Amount x Multiplier")
-    iv_col1, iv_col2 = st.columns(2)
-    with iv_col1:
-        sl_pct = st.number_input("SL (% of Invested Value)", value=5.0, min_value=0.5, step=0.5)
-        strategy_params['invested_value_sl_pct'] = sl_pct
-    with iv_col2:
-        tp_mult = st.number_input("TP (Multiplier of SL Amount)", value=2.0, min_value=1.0, step=0.5)
-        strategy_params['tp_sl_ratio'] = tp_mult
-
-elif sl_method_choice == "ATR":
-    st.info("Using dynamic ATR-based Take Profit and Stop Loss.")
-    atr_col1, atr_col2, atr_col3 = st.columns(3)
-    with atr_col1: strategy_params['atr_period'] = st.number_input("ATR Period", value=14, min_value=1)
-    with atr_col2: strategy_params['atr_tp_multiplier'] = st.number_input("ATR TP Multiplier", value=0.5, min_value=0.1, step=0.1, format="%.1f")
-    with atr_col3: strategy_params['atr_sl_multiplier'] = st.number_input("ATR SL Multiplier", value=0.5, min_value=0.1, step=0.1, format="%.1f")
-
-# --- End Risk Management ---
-
-
-# Run Backtest
-if st.button("🚀 RUN INTRADAY BACKTEST", width='stretch', type="primary"):
-    with st.spinner(f"Fetching {backtest_period} of real {backtest_interval} data..."):
-        try:
-            # --- RE-ADDED initial_capital to the engine ---
-            tester.engine.initial_capital = strategy_params['initial_capital']
-            
-            result = tester.engine.run_backtest(
-                strategy_name="ema_daily_trend", 
-                symbol="BANKNIFTY",
-                period=backtest_period,
-                interval=backtest_interval, 
-                **strategy_params
-            )
-
-            st.session_state.backtest_result = result
-            st.success(f"✅ Backtest completed! {result.total_trades} trades analyzed on REAL 5m data.")
-
-        except Exception as e:
-            st.error(f"❌ Backtest failed: {e}")
-            st.exception(e)
-
-# Display Results
-if 'backtest_result' in st.session_state:
-    result = st.session_state.backtest_result
-    st.markdown("---")
-    st.subheader("📊 BACKTEST RESULTS (ON REAL 5m DATA)")
-    
-    # ... (Metrics display as before) ...
-    col1, col2, col3, col4 = st.columns(4)
-    with col1: st.metric("Total P&L", f"₹{result.total_pnl:,.0f}")
-    with col1: st.metric("Win Rate", f"{result.win_rate:.1f}%")
-    with col2: st.metric("Total Trades", result.total_trades)
-    with col2: st.metric("Profit Factor", f"{result.profit_factor:.2f}")
-    with col3: st.metric("Max Drawdown", f"{result.max_drawdown:.1f}%")
-    with col3: st.metric("Sharpe Ratio", f"{result.sharpe_ratio:.2f}")
-    with col4: st.metric("Best Trade", f"₹{result.best_trade:,.0f}")
-    with col4: st.metric("Worst Trade", f"₹{result.worst_trade:,.0f}")
-
-    # Equity Curve
-    st.markdown("#### 📈 Portfolio Growth")
-    if result.equity_curve is not None and not result.equity_curve.empty:
-        if isinstance(result.equity_curve.index, pd.DatetimeIndex): chart_data = result.equity_curve['equity']
-        else: st.warning("Equity curve index is not timestamp."); chart_data = result.equity_curve['equity']
-        st.line_chart(chart_data)
-    else: st.info("No equity data to plot.")
-
-    # Trade Analysis
-    if result.trade_details:
-        st.markdown("#### 📋 Full Trade Log")
-        trades_df = pd.DataFrame(result.trade_details)
-        all_trades = trades_df.copy()
-        all_trades['entry_time'] = pd.to_datetime(all_trades['entry_time'], errors='coerce').dt.strftime('%m/%d %H:%M')
-        all_trades['exit_time'] = pd.to_datetime(all_trades['exit_time'], errors='coerce').dt.strftime('%m/%d %H:%M')
-        all_trades['invested_amount_fmt'] = all_trades['invested_amount'].apply(lambda x: f"₹{x:,.0f}" if pd.notna(x) else 'N/A')
-        all_trades['entry_price_fmt'] = all_trades['entry_price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else 'N/A')
-        all_trades['exit_price_fmt'] = all_trades['exit_price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else 'N/A')
-        all_trades['pnl_fmt'] = all_trades['pnl'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else 'N/A')
-        
-        display_columns = [
-            'entry_time', 'simulated_option', 'quantity', 'invested_amount_fmt',
-            'entry_price_fmt', 'exit_time', 'exit_price_fmt', 'pnl_fmt', 'exit_reason'
-        ]
-        display_columns = [col for col in display_columns if col in all_trades.columns]
-        
-        st.dataframe(all_trades[display_columns], width="stretch", height=400)
-    else: st.info("No trades were executed during this backtest period.")
