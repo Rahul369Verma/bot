@@ -29,7 +29,7 @@ class BacktestDataManager:
         st.info(f"🔄 Fetching REAL historical data for {ticker_symbol} ({period}, {interval})...")
 
         if interval != '1d' and period not in ['1d', '5d', '1mo', '60d']:
-             st.error(f"yfinance Limitation: Intraday data (15m, 30m, 1h) is only available for the last 60 days. Your '{period}' request will likely fail.")
+             st.error(f"yfinance Limitation: Intraday data is only available for the last 60 days. Your '{period}' request will likely fail.")
         
         try:
             ticker = yf.Ticker(ticker_symbol)
@@ -44,22 +44,18 @@ class BacktestDataManager:
                 st.error(f"No data returned from yfinance for {ticker_symbol} with period={period}, interval={interval}.")
                 raise Exception("No data returned from yfinance. Backtest cannot proceed.")
 
-            # --- NEW: TIMEZONE AND MARKET HOURS FIX ---
-            
-            # 1. Check if index is naive (it should be)
+            # --- TIMEZONE AND MARKET HOURS FIX ---
             if data.index.tz is None:
-                # Localize the naive UTC timestamps from yfinance
-                data.index = data.index.tz_localize('UTC')
+                try: data.index = data.index.tz_localize('UTC')
+                except Exception: pass
             
-            # 2. Convert to Indian Standard Time
-            data.index = data.index.tz_convert('Asia/Kolkata')
+            try: data.index = data.index.tz_convert('Asia/Kolkata')
+            except Exception: pass
             
-            # 3. Filter to NSE market hours (9:15 to 15:30)
-            data = data.between_time('09:15', '15:30')
+            # --- UPDATED: Stop at 15:20 ---
+            data = data.between_time('09:15', '15:20')
             
-            # 4. Make index naive again to simplify downstream processing
             data.index = data.index.tz_localize(None)
-            
             # --- END OF FIX ---
             
             data.rename(columns={
@@ -72,7 +68,7 @@ class BacktestDataManager:
 
             data.dropna(subset=required_cols, inplace=True)
             
-            st.success(f"✅ Fetched and filtered {len(data)} real market candles (09:15-15:30 IST).")
+            st.success(f"✅ Fetched and filtered {len(data)} real market candles (09:15-15:20 IST).")
             return data
         
         except Exception as e:
