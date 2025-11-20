@@ -1,7 +1,7 @@
 # Modified: src/ui/streamlit_app.py
-# - Added 'optimizer_running' to session_state
-# - Auto-refresh in tab1 is now blocked by this flag.
-# - Optimizer button in tab3 now sets/unsets this flag using try...finally.
+# - Added 'backtest_running' session state flag.
+# - The "RUN INTRADAY BACKTEST" button in tab2 now sets this flag.
+# - The auto-refresh in tab1 now checks for *both* flags.
 
 import os
 import sys
@@ -24,9 +24,11 @@ if src_dir not in sys.path:
 try:
     from fetcher.angel_client import AngelClient 
     from backtest.backtest import StrategyTester 
+    from fetcher.fyers_data import FyersDataManager
 except ImportError as e:
     st.error(f"CRITICAL IMPORT ERROR: {e}")
     st.error(f"Failed to load modules. Is 'src' directory correctly added to path? Path being added: {src_dir}")
+    st.error("Have you run 'pip install -r requirements.txt --upgrade'?")
     st.stop()
 
 # ---------------------------
@@ -59,8 +61,17 @@ def bot_loop(client: AngelClient):
             time.sleep(5) 
 
 # ---------------------------
-# Initialize Angel Client
+# Initialize Core Components
 # ---------------------------
+@st.cache_resource
+def init_fyers_manager():
+    # ... (no change) ...
+    try:
+        return FyersDataManager()
+    except ValueError as e:
+        st.error(f"Failed to init Fyers Manager: {e}")
+        return None
+
 @st.cache_resource
 def init_angel_client(index_name: str):
     # ... (no change) ...
@@ -71,13 +82,13 @@ def init_angel_client(index_name: str):
         st.error(f"Failed to initialize Angel Client: {e}")
         return None
 
-# ---------------------------
-# Initialize StrategyTester
-# ---------------------------
 @st.cache_resource
-def init_strategy_tester():
+def init_strategy_tester(_fyers_manager):
+    # ... (no change) ...
+    if _fyers_manager is None:
+        return None
     try:
-        return StrategyTester()
+        return StrategyTester(fyers_manager=_fyers_manager)
     except Exception as e:
          st.error(f"Failed to initialize StrategyTester: {e}")
          return None
@@ -99,8 +110,9 @@ strategy_name_map = {
     'mta_ema_crossover': "MTA Crossover (EMA)"
 }
 
+fyers_manager = init_fyers_manager()
 angel = init_angel_client(index_name=selected_index)
-tester = init_strategy_tester()
+tester = init_strategy_tester(fyers_manager)
 
 # ---------------------------
 # Start the Bot Thread (Runs Once)
@@ -150,12 +162,23 @@ else:
 now_ist = datetime.now(IST)
 is_market_open = (now_ist.weekday() < 5) and (dt_time(9, 15) <= now_ist.time() <= dt_time(15, 30))
 
-# --- NEW: Initialize session state for optimizer ---
+# --- NEW: Initialize all session state flags ---
 if 'optimizer_running' not in st.session_state:
     st.session_state.optimizer_running = False
+if 'backtest_running' not in st.session_state: # <-- NEW
+    st.session_state.backtest_running = False
 # --- END NEW ---
 
-tab1, tab2, tab3 = st.tabs(["📈 Live Trading", "🔬 Single Backtest", "🚀 Optimizer"])
+if 'auth_code' in st.query_params and fyers_manager:
+    auth_code = st.query_params['auth_code']
+    with st.spinner("Generating Fyers Access Token..."):
+        if fyers_manager.generate_and_save_token(auth_code):
+            st.success("✅ Fyers Access Token generated and saved successfully! You can now run backtests.")
+            st.query_params.clear()
+        else:
+            st.error("❌ Failed to generate Fyers Access Token. Check your App ID/Secret.")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📈 Live Trading", "🔬 Single Backtest", "🚀 Optimizer", "🔑 Settings"])
 
 with tab1:
     # ---------------------------
@@ -197,27 +220,21 @@ with tab1:
             end_time=end_time_input
         )
         daily_pnl = angel.daily_pnl 
-        skip_day = angel.skip_today
+        skip_today = angel.skip_today
         scol1, scol2, scol3 = st.columns(3)
         with scol1:
             st.metric("Today's Realized P&L", f"₹{daily_pnl:,.2f}")
         with scol2:
             st.metric("Today's Trades", f"{angel.today_trades_count} / {max_trades_input}")
         with scol3:
-            if not is_market_open:
-                st.info("MARKET CLOSED")
-            elif daily_pnl <= -abs(max_loss_input):
-                st.error(f"STOPPED: Max loss hit.")
-            elif angel.today_trades_count >= max_trades_input:
-                st.error(f"STOPPED: Max trades hit.")
-            elif skip_day:
-                st.warning("SKIPPED: Lot cost < ₹10k.")
-            elif len(angel.positions_map) > 0:
-                st.success("POSITION OPEN")
-            elif not (start_time_input <= now_ist.time() <= end_time_input):
-                st.info("WAITING (Outside trade window)")
-            else:
-                st.success(f"MONITORING ({strategy_name_map[active_strategy_key]})")
+            if not is_market_open: st.info("MARKET CLOSED")
+            elif daily_pnl <= -abs(max_loss_input): st.error(f"STOPPED: Max loss hit.")
+            elif angel.today_trades_count >= max_trades_input: st.error(f"STOPPED: Max trades hit.")
+            elif skip_today: st.warning("SKIPPED: Lot cost < ₹10k.")
+            elif len(angel.positions_map) > 0: st.success("POSITION OPEN")
+            elif not (start_time_input <= now_ist.time() <= end_time_input): st.info("WAITING (Outside trade window)")
+            else: st.success(f"MONITORING ({strategy_name_map[active_strategy_key]})")
+    
     # ---------------------------
     # Market Data Section
     # ---------------------------
@@ -241,6 +258,7 @@ with tab1:
         except Exception as e:
             st.error(f"❌ Failed to load market data: {e}")
             if not is_market_open: st.info("This is expected as the market is closed.")
+    
     # ---------------------------
     # Live Positions & P&L
     # ---------------------------
@@ -276,6 +294,7 @@ with tab1:
                 df_history['time'] = pd.to_datetime(df_history['timestamp'], unit='s').dt.strftime('%H:%M:%S')
                 st.dataframe(df_history[['time', 'tradingsymbol', 'quantity', 'price', 'pnl']], width='stretch')
         except Exception as e: st.error(f"❌ Paper trading error: {e}")
+    
     # ---------------------------
     # Manual Trade Testing Section
     # ---------------------------
@@ -297,6 +316,7 @@ with tab1:
                     result = angel.execute_manual_test_trade(signal_type='PE')
                     if result.get('status'): st.success(f"✅ {result.get('message')}")
                     else: st.error(f"❌ {result.get('message')}")
+    
     # ---------------------------
     # Real Option Chain Section
     # ---------------------------
@@ -344,7 +364,7 @@ with tab1:
             if not is_market_open: st.info("This is expected as the market is closed.")
             
     # --- MODIFIED: Auto-refresh is now CONDITIONAL ---
-    if not st.session_state.optimizer_running:
+    if not st.session_state.optimizer_running and not st.session_state.backtest_running:
         try:
             from streamlit_autorefresh import st_autorefresh
             st_autorefresh(interval=UI_REFRESH_SECONDS * 1000, limit=None, key="ui_refresh")
@@ -359,17 +379,20 @@ with tab2:
     # ---------------------------
     # Backtesting Section
     # ---------------------------
-    # ... (no change in this tab) ...
     st.subheader(f"🧪 Backtest Engine (Index: {selected_index})") 
+
     if not tester:
-        st.error("StrategyTester failed to initialize. Check logs.")
+        st.error("StrategyTester failed to initialize. Check Fyers credentials in Settings.")
     else:
         bt_strategy_key = "mta_ema_crossover"
         bt_strategy_params_default = tester.get_strategy_parameters(bt_strategy_key)
         st.info(tester.engine.strategies[bt_strategy_key].description)
-        backtest_interval = "5m"; st.info(f"Using **{backtest_interval}** data interval for signals (Max 60 days).")
-        period_options = ["1d", "5d", "1mo", "60d"]; default_index = 3 
-        backtest_period = st.selectbox("Test Period (Max 60d)", period_options, index=default_index, key="backtest_period")
+        st.info("Using **5m** data interval from Fyers.")
+        bt_date_col1, bt_date_col2 = st.columns(2)
+        with bt_date_col1:
+            start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
+        with bt_date_col2:
+            end_date = st.date_input("End Date", datetime.now())
         st.markdown("#### 🛡️ Risk & Sizing (Defaults from strategy)")
         strategy_params = {} 
         strategy_params['initial_capital'] = st.number_input("Starting Capital (₹)", value=20000, min_value=10000, key="bt_init_cap")
@@ -410,22 +433,34 @@ with tab2:
             em_col1, em_col2 = st.columns(2)
             with em_col1: strategy_params['ema_short'] = st.number_input("EMA Short", value=bt_strategy_params_default.get('ema_short', 9), min_value=1, key="bt_ema_s")
             with em_col2: strategy_params['ema_long'] = st.number_input("EMA Long", value=bt_strategy_params_default.get('ema_long', 15), min_value=1, key="bt_ema_l")
+        
+        # --- MODIFIED: Added try...finally block ---
         if st.button("🚀 RUN INTRADAY BACKTEST", use_container_width=True, type="primary"):
-            with st.spinner(f"Fetching {backtest_period} of real {backtest_interval} data for {selected_index}..."):
+            if not fyers_manager or not fyers_manager.is_authenticated():
+                st.error("Fyers API is not authenticated. Please go to the 'Settings' tab to generate a token.")
+            else:
+                st.session_state.backtest_running = True # <-- SET FLAG
                 try:
-                    tester.engine.initial_capital = strategy_params['initial_capital']
-                    result = tester.engine.run_backtest(
-                        strategy_name=bt_strategy_key, 
-                        symbol=selected_index, 
-                        period=backtest_period, 
-                        interval=backtest_interval, 
-                        silent=False,
-                        **strategy_params
-                    )
-                    st.session_state.backtest_result = result
-                    st.success(f"✅ Backtest completed! {result.total_trades} trades analyzed.")
+                    with st.spinner(f"Fetching Fyers 5m data for {selected_index} from {start_date} to {end_date}..."):
+                        tester.engine.initial_capital = strategy_params['initial_capital']
+                        result = tester.engine.run_backtest(
+                            strategy_name=bt_strategy_key, 
+                            symbol=selected_index, 
+                            start_date=start_date, 
+                            end_date=end_date, 
+                            interval="5",
+                            silent=False,
+                            **strategy_params
+                        )
+                        st.session_state.backtest_result = result
+                        st.success(f"✅ Backtest completed! {result.total_trades} trades analyzed.")
                 except Exception as e:
                     st.error(f"❌ Backtest failed: {e}"); st.exception(e)
+                finally:
+                    st.session_state.backtest_running = False # <-- UNSET FLAG
+                    st.rerun() # Rerun to show results and re-enable refresh
+        # --- END MODIFIED ---
+
         if 'backtest_result' in st.session_state:
             result = st.session_state.backtest_result
             st.markdown("---"); st.subheader("📊 BACKTEST RESULTS")
@@ -454,10 +489,10 @@ with tab3:
     # ---------------------------
     # Optimizer Section
     # ---------------------------
-    # ... (no change in parameter space) ...
+    # ... (no change in this tab) ...
     st.subheader("🚀 Strategy Parameter Optimizer")
     st.markdown(f"This tool will run many backtests with random parameters for the **MTA Crossover** strategy on **{selected_index}** to find profitable combinations.")
-    st.warning(f"""
+    st.warning(r"""
     **Target Metrics:**
     - **Sharpe Ratio:** $\geq 1.0$
     - **Win Rate:** $> 50\%$
@@ -483,36 +518,29 @@ with tab3:
     with opt_col1:
         num_iterations = st.number_input("Number of Iterations", min_value=10, max_value=1000, value=200, step=10)
     with opt_col2:
-        opt_period = st.selectbox("Optimization Period", ["1mo", "60d"], index=1, key="opt_period")
-
+        opt_start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365*2), key="opt_start")
+        opt_end_date = st.date_input("End Date", datetime.now(), key="opt_end")
     if 'optimizer_results' not in st.session_state:
         st.session_state.optimizer_results = []
-
-    # --- MODIFIED: This is the full fix ---
     if st.button(f"🚀 RUN OPTIMIZER ({num_iterations} Iterations)", use_container_width=True, type="primary"):
         if not tester:
-            st.error("Tester not initialized. Cannot run optimization.")
+            st.error("Tester not initialized. Check Fyers credentials in Settings.")
+        elif not fyers_manager or not fyers_manager.is_authenticated():
+            st.error("Fyers API is not authenticated. Please go to the 'Settings' tab to generate a token.")
         else:
-            # 1. SET FLAG TO STOP AUTOREFRESH
             st.session_state.optimizer_running = True
-            
             log_messages = []
             progress_bar = st.progress(0, text="Optimizer starting...")
             status_text = st.empty()
-            
             try:
-                # 2. FETCH DATA ONCE
-                status_text.text(f"Fetching {opt_period} data for {selected_index}...")
+                status_text.text(f"Fetching Fyers data for {selected_index} from {opt_start_date} to {opt_end_date}...")
                 data = tester.engine.data_manager.get_historical_data(
-                    selected_index, opt_period, "5m", is_backtest_log=False
+                    selected_index, opt_start_date, opt_end_date, "5", is_backtest_log=True
                 )
                 if data is None or data.empty:
                     raise Exception("No data returned for optimizer.")
-                
                 status_text.text(f"Data fetched ({len(data)} candles). Starting {num_iterations} iterations...")
-                st.session_state.optimizer_results = [] # Clear previous results
-                
-                # 3. RUN LOOP (NOW SYNC AND WITHOUT NETWORK CALLS)
+                st.session_state.optimizer_results = []
                 for i in range(num_iterations):
                     try:
                         rand_params = {
@@ -529,25 +557,22 @@ with tab3:
                         }
                         if rand_params['ema_short'] >= rand_params['ema_long']:
                             rand_params['ema_long'] = rand_params['ema_short'] + 1
-                        
-                        # Pass the pre-fetched 'data'
                         result = tester.engine.run_backtest(
                             strategy_name=active_strategy_key,
                             symbol=selected_index,
-                            period=opt_period,
-                            interval="5m",
+                            start_date=opt_start_date,
+                            end_date=opt_end_date,
+                            interval="5",
                             silent=True, 
-                            data=data.copy(), # Pass a copy
+                            data=data.copy(),
                             **rand_params
                         )
-                        
                         is_good = (
                             result.sharpe_ratio >= 0.5 and
                             result.win_rate > 40 and
-                            result.total_trades > 5 and
+                            result.total_trades > 10 and
                             result.max_drawdown < 50
                         )
-                        
                         if is_good:
                             log_messages.append(f"✅ Found profitable result at iteration {i+1}!")
                             st.session_state.optimizer_results.append({
@@ -565,24 +590,17 @@ with tab3:
                                 "start_time": rand_params['trade_start_time'].strftime("%H:%M"),
                                 "end_time": rand_params['trade_end_time'].strftime("%H:%M"),
                             })
-                        # Optional: Log all results if you want to see them
-                        # else:
-                        #    log_messages.append(f"Iteration {i+1}: Sharpe {result.sharpe_ratio:.2f}, WR {result.win_rate:.1f}%, Trades {result.total_trades}, DD {result.max_drawdown:.1f}%")
-                    
+                        else:
+                            log_messages.append(f"Iteration {i+1}: Sharpe {result.sharpe_ratio:.2f}, WR {result.win_rate:.1f}%, Trades {result.total_trades}, DD {result.max_drawdown:.1f}%")
                     except Exception as e:
                         log_messages.append(f"❌ Iteration {i+1} failed: {e}")
-                    
                     progress_bar.progress((i + 1) / num_iterations, text=f"Optimizer running... {i+1}/{num_iterations}")
-                
                 progress_bar.progress(1.0, text="Optimization complete!")
                 status_text.empty()
                 st.text_area("Optimization Log", value="\n".join(log_messages), height=300)
-
-            # 4. ALWAYS unset the flag, even if the loop fails
             finally:
                 st.session_state.optimizer_running = False
-                st.rerun() # Force a rerun to update the UI and re-enable refresh
-    # --- END OF FIX ---
+                st.rerun()
 
     if st.session_state.optimizer_results:
         st.subheader("🏆 Optimizer Results")
@@ -595,3 +613,29 @@ with tab3:
         st.dataframe(results_df.sort_values(by="Sharpe", ascending=False), use_container_width=True)
     else:
         st.info("No optimization results yet. Run the optimizer to see results.")
+
+with tab4:
+    # ---------------------------
+    # Settings Tab
+    # ---------------------------
+    # ... (no change in this tab) ...
+    st.subheader("🔑 Fyers API Settings")
+    if not fyers_manager:
+        st.error("Fyers Manager failed to initialize. Check your .env file.")
+        st.code("Create a .env file in the root directory with:\n\nFYERS_APP_ID=YOUR_APP_ID\nFYERS_SECRET_KEY=YOUR_SECRET_KEY\nFYERS_REDIRECT_URL=YOUR_NGROK_URL")
+    else:
+        st.info(f"**App ID:** `{fyers_manager.app_id[:4]}...{fyers_manager.app_id[-4:]}`")
+        st.info(f"**Redirect URL:** `{fyers_manager.redirect_url}`")
+        st.warning("Ensure your Redirect URL in the Fyers App Dashboard matches *exactly*.")
+    
+        if fyers_manager.is_authenticated():
+            st.success("✅ Fyers API is authenticated and ready.")
+            st.write(f"Your Access Token is saved in `fyers_token.json`")
+        else:
+            st.error("Fyers API is not authenticated.")
+            try:
+                login_url = fyers_manager.get_login_url()
+                st.link_button("1. Click here to log in to Fyers", login_url, type="primary")
+                st.write("2. After logging in, you will be redirected back here. The app will automatically generate and save your token.")
+            except Exception as e:
+                st.error(f"Could not generate login URL: {e}")
