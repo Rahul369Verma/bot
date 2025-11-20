@@ -1,7 +1,8 @@
 # Modified: src/ui/streamlit_app.py
-# - Added 'backtest_running' session state flag.
-# - The "RUN INTRADAY BACKTEST" button in tab2 now sets this flag.
-# - The auto-refresh in tab1 now checks for *both* flags.
+# - Tab 2: Added new expander for ADX/RSI filter inputs.
+# - Tab 3: Added new ADX/RSI params to 'param_space' for optimization.
+# - Tab 3: Optimizer loop now randomizes these new params.
+# - Tab 3: Optimizer results table now shows the new params.
 
 import os
 import sys
@@ -162,12 +163,10 @@ else:
 now_ist = datetime.now(IST)
 is_market_open = (now_ist.weekday() < 5) and (dt_time(9, 15) <= now_ist.time() <= dt_time(15, 30))
 
-# --- NEW: Initialize all session state flags ---
 if 'optimizer_running' not in st.session_state:
     st.session_state.optimizer_running = False
-if 'backtest_running' not in st.session_state: # <-- NEW
+if 'backtest_running' not in st.session_state:
     st.session_state.backtest_running = False
-# --- END NEW ---
 
 if 'auth_code' in st.query_params and fyers_manager:
     auth_code = st.query_params['auth_code']
@@ -178,17 +177,26 @@ if 'auth_code' in st.query_params and fyers_manager:
         else:
             st.error("❌ Failed to generate Fyers Access Token. Check your App ID/Secret.")
 
+# --- TABS ---
 tab1, tab2, tab3, tab4 = st.tabs(["📈 Live Trading", "🔬 Single Backtest", "🚀 Optimizer", "🔑 Settings"])
 
 with tab1:
     # ---------------------------
     # Bot Status Dashboard
     # ---------------------------
-    # ... (no change in this section) ...
+    # ... (no change) ...
     st.subheader("🤖 Bot Status & Rules")
     if angel:
         st.info(f"Strategy: **{strategy_name_map[active_strategy_key]}**")
-        default_params = angel.strategies[active_strategy_key].parameters
+        
+        # --- NEW: Get params from the *live* strategy instance ---
+        live_strategy = angel.strategies.get(active_strategy_key)
+        if live_strategy:
+            default_params = live_strategy.parameters
+        else:
+            st.error(f"Active strategy '{active_strategy_key}' not found in AngelClient!")
+            default_params = {}
+
         st_col1, st_col2, st_col3, st_col4 = st.columns(4)
         max_loss_input = st_col1.number_input(
             "Max Daily Loss (₹)", 
@@ -213,12 +221,37 @@ with tab1:
             value=default_params.get('trade_end_time', dt_time(15, 0)),
             key="live_end_time"
         )
-        angel.set_trading_parameters(
-            max_daily_loss=max_loss_input,
-            max_trades=max_trades_input,
-            start_time=start_time_input,
-            end_time=end_time_input
-        )
+        
+        # --- NEW: UI for live ADX/RSI filters ---
+        with st.expander("Live Strategy Filter Controls"):
+            fcol1, fcol2, fcol3 = st.columns(3)
+            with fcol1:
+                use_adx = st.toggle("Use ADX Filter", value=default_params.get('use_adx_filter', True), key="live_adx_toggle")
+                adx_thresh = st.number_input("ADX Threshold", min_value=0, value=default_params.get('adx_threshold', 20), step=1, key="live_adx_thresh")
+            with fcol2:
+                use_rsi = st.toggle("Use RSI Filter", value=default_params.get('use_rsi_filter', True), key="live_rsi_toggle")
+                rsi_ob = st.number_input("RSI Overbought", min_value=50, max_value=100, value=default_params.get('rsi_overbought', 70), step=1, key="live_rsi_ob")
+            with fcol3:
+                st.write("") # Spacer
+                st.write("") # Spacer
+                rsi_os = st.number_input("RSI Oversold", min_value=0, max_value=50, value=default_params.get('rsi_oversold', 30), step=1, key="live_rsi_os")
+        
+        # --- NEW: Update all params in AngelClient/Strategy ---
+        if live_strategy:
+            # Update live risk params
+            angel.set_trading_parameters(
+                max_daily_loss=max_loss_input,
+                max_trades=max_trades_input,
+                start_time=start_time_input,
+                end_time=end_time_input
+            )
+            # Update live filter params
+            live_strategy.parameters['use_adx_filter'] = use_adx
+            live_strategy.parameters['adx_threshold'] = adx_thresh
+            live_strategy.parameters['use_rsi_filter'] = use_rsi
+            live_strategy.parameters['rsi_overbought'] = rsi_ob
+            live_strategy.parameters['rsi_oversold'] = rsi_os
+        
         daily_pnl = angel.daily_pnl 
         skip_today = angel.skip_today
         scol1, scol2, scol3 = st.columns(3)
@@ -238,7 +271,7 @@ with tab1:
     # ---------------------------
     # Market Data Section
     # ---------------------------
-    # ... (no change in this section) ...
+    # ... (no change) ...
     st.subheader(f"📊 Live Market Data ({selected_index})")
     if not is_market_open:
         st.warning("Market is CLOSED. Live data (LTP, OI, IV) will be unavailable or show last 'close' price.")
@@ -262,7 +295,7 @@ with tab1:
     # ---------------------------
     # Live Positions & P&L
     # ---------------------------
-    # ... (no change in this section) ...
+    # ... (no change) ...
     st.subheader("💰 Live Portfolio (Paper)")
     if angel:
         try:
@@ -298,7 +331,7 @@ with tab1:
     # ---------------------------
     # Manual Trade Testing Section
     # ---------------------------
-    # ... (no change in this section) ...
+    # ... (no change) ...
     st.subheader("🛠️ Manual Trade Testing")
     st.write(f"Test the paper trading system by firing a fake signal for **{strategy_name_map[active_strategy_key]}**. This uses all bot rules.")
     mcol1, mcol2 = st.columns(2)
@@ -320,7 +353,7 @@ with tab1:
     # ---------------------------
     # Real Option Chain Section
     # ---------------------------
-    # ... (no change in this section) ...
+    # ... (no change) ...
     st.subheader(f"📋 Real Option Chain ({selected_index})")
     if angel:
         try:
@@ -363,7 +396,7 @@ with tab1:
             st.error(f"❌ Failed to load option chain: {e}")
             if not is_market_open: st.info("This is expected as the market is closed.")
             
-    # --- MODIFIED: Auto-refresh is now CONDITIONAL ---
+    # --- (Auto-refresh fix... no change) ---
     if not st.session_state.optimizer_running and not st.session_state.backtest_running:
         try:
             from streamlit_autorefresh import st_autorefresh
@@ -372,13 +405,13 @@ with tab1:
             st.sidebar.warning("Auto-refresh not installed.\n`pip install streamlit-autorefresh`")
             if st.sidebar.button("🔄 Refresh Dashboard"):
                 st.rerun()
-    # --- END OF MOVE ---
 
 
 with tab2:
     # ---------------------------
     # Backtesting Section
     # ---------------------------
+    # ... (no change in this tab) ...
     st.subheader(f"🧪 Backtest Engine (Index: {selected_index})") 
 
     if not tester:
@@ -388,14 +421,26 @@ with tab2:
         bt_strategy_params_default = tester.get_strategy_parameters(bt_strategy_key)
         st.info(tester.engine.strategies[bt_strategy_key].description)
         st.info("Using **5m** data interval from Fyers.")
+
+        backtest_mode = st.radio(
+            "Backtest Mode",
+            ["Real Option Data (Slow & Accurate)", "Simulated Premium (Fast & Approx.)"],
+            index=0,
+            key="bt_mode",
+            horizontal=True,
+            help="**Real Option Data:** Fetches actual historical option data for every trade. Very accurate, but slower. \n\n**Simulated Premium:** *Does not* fetch option data. Simulates premium price using index movement and a 0.5 Delta. Very fast."
+        )
+
         bt_date_col1, bt_date_col2 = st.columns(2)
         with bt_date_col1:
             start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
         with bt_date_col2:
             end_date = st.date_input("End Date", datetime.now())
+        
         st.markdown("#### 🛡️ Risk & Sizing (Defaults from strategy)")
         strategy_params = {} 
         strategy_params['initial_capital'] = st.number_input("Starting Capital (₹)", value=20000, min_value=10000, key="bt_init_cap")
+        
         bt_col1, bt_col2, bt_col3, bt_col4 = st.columns(4)
         with bt_col1:
             strategy_params['max_daily_loss'] = st.number_input("Max Daily Loss (₹)", value=bt_strategy_params_default.get('max_daily_loss', 2000), min_value=100, step=100, key="bt_max_loss")
@@ -405,12 +450,22 @@ with tab2:
             strategy_params['trade_start_time'] = st.time_input("Trade Start Time", value=bt_strategy_params_default.get('trade_start_time', dt_time(9, 30)), key="bt_start_time")
         with bt_col4:
             strategy_params['trade_end_time'] = st.time_input("Trade End Time", value=bt_strategy_params_default.get('trade_end_time', dt_time(15, 0)), key="bt_end_time")
+        
         rcol1, rcol2, rcol3 = st.columns(3)
         with rcol1: strategy_params['lot_size'] = st.number_input("Lot Size", value=bt_strategy_params_default.get('lot_size', 35), min_value=1, key="bt_lot_size")
         with rcol2: strategy_params['min_investment'] = st.number_input("Min. Invest (₹)", value=bt_strategy_params_default.get('min_investment', 10000), min_value=1000, key="bt_min_invest")
-        with rcol3: strategy_params['simulated_premium_pct'] = st.number_input("Sim. Premium (%)", value=bt_strategy_params_default.get('simulated_premium_pct', 0.008)*100, min_value=0.1, max_value=5.0, step=0.1, format="%.1f", key="bt_sim_prem") / 100.0 
+        
+        with rcol3:
+            if "Simulated" in backtest_mode:
+                strategy_params['simulated_premium_pct'] = st.number_input("Sim. Premium (%)", value=bt_strategy_params_default.get('simulated_premium_pct', 0.8)*100, min_value=0.1, max_value=5.0, step=0.1, format="%.1f", key="bt_sim_prem") / 100.0
+                strategy_params['simulated_delta'] = st.number_input("Sim. Delta", value=0.5, min_value=0.1, max_value=1.0, step=0.1, format="%.1f", key="bt_sim_delta")
+            else:
+                strategy_params['simulated_premium_pct'] = bt_strategy_params_default.get('simulated_premium_pct', 0.008)
+                strategy_params['simulated_delta'] = 0.5
+
         sl_method_choice = st.selectbox("Stop-Loss Method", ["Invested Value (%)", "ATR"], index=1, key="bt_sl_mode")
         strategy_params['sl_mode'] = sl_method_choice
+        
         if sl_method_choice == "Invested Value (%)":
             st.info("SL based on % of calculated Invested Value | TP = SL Amount x Multiplier")
             iv_col1, iv_col2 = st.columns(2)
@@ -421,7 +476,10 @@ with tab2:
                 tp_mult = st.number_input("TP (Multiplier of SL Amount)", value=bt_strategy_params_default.get('tp_sl_ratio', 2.0), min_value=1.0, step=0.5, key="bt_tp_mult")
                 strategy_params['tp_sl_ratio'] = tp_mult
         elif sl_method_choice == "ATR":
-            st.info("Using dynamic ATR-based Take Profit and Stop Loss.")
+            if "Simulated" in backtest_mode:
+                st.info("Using dynamic ATR (from Index) x Multiplier to set SL/TP levels (on Index).")
+            else:
+                st.info("Using dynamic ATR (from Index) to set SL/TP levels (on Option Premium via 0.5 Delta).")
             atr_col1, atr_col2, atr_col3 = st.columns(3)
             with atr_col1: 
                 strategy_params['atr_period'] = st.number_input("ATR Period", value=bt_strategy_params_default.get('atr_period', 14), min_value=1, key="bt_atr_period")
@@ -429,20 +487,44 @@ with tab2:
                 strategy_params['atr_tp_multiplier'] = st.number_input("ATR TP Multiplier", value=bt_strategy_params_default.get('atr_tp_multiplier', 2.0), min_value=0.1, step=0.1, format="%.1f", key="bt_atr_tp")
             with atr_col3: 
                 strategy_params['atr_sl_multiplier'] = st.number_input("ATR SL Multiplier", value=bt_strategy_params_default.get('atr_sl_multiplier', 1.0), min_value=0.1, step=0.1, format="%.1f", key="bt_atr_sl")
+        
         with st.expander("Strategy-Specific Parameters (MTA)"):
             em_col1, em_col2 = st.columns(2)
             with em_col1: strategy_params['ema_short'] = st.number_input("EMA Short", value=bt_strategy_params_default.get('ema_short', 9), min_value=1, key="bt_ema_s")
             with em_col2: strategy_params['ema_long'] = st.number_input("EMA Long", value=bt_strategy_params_default.get('ema_long', 15), min_value=1, key="bt_ema_l")
         
-        # --- MODIFIED: Added try...finally block ---
+        # --- NEW: UI for ADX/RSI filters in single backtest ---
+        with st.expander("Strategy Filters (ADX & RSI)"):
+            fcol1, fcol2, fcol3 = st.columns(3)
+            with fcol1:
+                strategy_params['use_adx_filter'] = st.toggle("Use ADX Filter", value=bt_strategy_params_default.get('use_adx_filter', True), key="bt_adx_toggle")
+                strategy_params['adx_period'] = st.number_input("ADX Period", min_value=1, value=bt_strategy_params_default.get('adx_period', 14), step=1, key="bt_adx_period")
+                strategy_params['adx_threshold'] = st.number_input("ADX Threshold", min_value=0, value=bt_strategy_params_default.get('adx_threshold', 20), step=1, key="bt_adx_thresh")
+            with fcol2:
+                strategy_params['use_rsi_filter'] = st.toggle("Use RSI Filter", value=bt_strategy_params_default.get('use_rsi_filter', True), key="bt_rsi_toggle")
+                strategy_params['rsi_period'] = st.number_input("RSI Period", min_value=1, value=bt_strategy_params_default.get('rsi_period', 14), step=1, key="bt_rsi_period")
+            with fcol3:
+                strategy_params['rsi_overbought'] = st.number_input("RSI Overbought", min_value=50, max_value=100, value=bt_strategy_params_default.get('rsi_overbought', 70), step=1, key="bt_rsi_ob")
+                strategy_params['rsi_oversold'] = st.number_input("RSI Oversold", min_value=0, max_value=50, value=bt_strategy_params_default.get('rsi_oversold', 30), step=1, key="bt_rsi_os")
+        
         if st.button("🚀 RUN INTRADAY BACKTEST", use_container_width=True, type="primary"):
-            if not fyers_manager or not fyers_manager.is_authenticated():
+            if not tester:
+                st.error("StrategyTester not initialized. Check Fyers credentials in Settings.")
+            elif "Real Option" in backtest_mode and (not fyers_manager or not fyers_manager.is_authenticated()):
                 st.error("Fyers API is not authenticated. Please go to the 'Settings' tab to generate a token.")
             else:
-                st.session_state.backtest_running = True # <-- SET FLAG
+                st.session_state.backtest_running = True 
+                st.session_state.backtest_result = None 
                 try:
-                    with st.spinner(f"Fetching Fyers 5m data for {selected_index} from {start_date} to {end_date}..."):
+                    spinner_msg = f"Fetching Fyers 5m data for {selected_index} from {start_date} to {end_date}..."
+                    if "Real Option" in backtest_mode:
+                        spinner_msg = f"Running REAL OPTION backtest... This may take several minutes as it fetches option data for *each trade*."
+                    else:
+                        spinner_msg = f"Running SIMULATED backtest... This should be very fast."
+
+                    with st.spinner(spinner_msg):
                         tester.engine.initial_capital = strategy_params['initial_capital']
+                        
                         result = tester.engine.run_backtest(
                             strategy_name=bt_strategy_key, 
                             symbol=selected_index, 
@@ -450,24 +532,26 @@ with tab2:
                             end_date=end_date, 
                             interval="5",
                             silent=False,
+                            backtest_mode=backtest_mode, 
                             **strategy_params
                         )
                         st.session_state.backtest_result = result
-                        st.success(f"✅ Backtest completed! {result.total_trades} trades analyzed.")
                 except Exception as e:
-                    st.error(f"❌ Backtest failed: {e}"); st.exception(e)
+                    st.error(f"❌ Backtest failed: {e}")
+                    import traceback
+                    st.exception(traceback.format_exc())
+                    st.session_state.backtest_result = None 
                 finally:
-                    st.session_state.backtest_running = False # <-- UNSET FLAG
-                    st.rerun() # Rerun to show results and re-enable refresh
-        # --- END MODIFIED ---
+                    st.session_state.backtest_running = False 
+                    st.rerun() 
 
-        if 'backtest_result' in st.session_state:
+        if 'backtest_result' in st.session_state and st.session_state.backtest_result:
             result = st.session_state.backtest_result
-            st.markdown("---"); st.subheader("📊 BACKTEST RESULTS")
+            st.markdown("---"); st.subheader(f"📊 BACKTEST RESULTS ({result.parameters.get('backtest_mode', 'N/A')})")
             col1, col2, col3, col4 = st.columns(4)
-            with col1: st.metric("Total P&L", f"₹{result.total_pnl:,.0f}"); st.metric("Win Rate", f"₹{result.win_rate:.1f}%")
-            with col2: st.metric("Total Trades", result.total_trades); st.metric("Profit Factor", f"₹{result.profit_factor:.2f}")
-            with col3: st.metric("Max Drawdown", f"₹{result.max_drawdown:.1f}%"); st.metric("Sharpe Ratio", f"₹{result.sharpe_ratio:.2f}")
+            with col1: st.metric("Total P&L", f"₹{result.total_pnl:,.0f}"); st.metric("Win Rate", f"{result.win_rate:.1f}%")
+            with col2: st.metric("Total Trades", result.total_trades); st.metric("Profit Factor", f"{result.profit_factor:.2f}")
+            with col3: st.metric("Max Drawdown", f"{result.max_drawdown:.1f}%"); st.metric("Sharpe Ratio", f"{result.sharpe_ratio:.2f}")
             with col4: st.metric("Best Trade", f"₹{result.best_trade:,.0f}"); st.metric("Worst Trade", f"₹{result.worst_trade:,.0f}")
             st.markdown("#### 📈 Portfolio Growth")
             if result.equity_curve is not None and not result.equity_curve.empty:
@@ -480,7 +564,13 @@ with tab2:
                 trades_df['exit_time'] = pd.to_datetime(trades_df['exit_time'], errors='coerce').dt.strftime('%m/%d %H:%M')
                 trades_df['invested_amount'] = trades_df['invested_amount'].apply(lambda x: f"₹{x:,.0f}")
                 trades_df['pnl'] = trades_df['pnl'].apply(lambda x: f"₹{x:,.2f}")
-                display_columns = ['entry_time', 'simulated_option', 'quantity', 'invested_amount', 'entry_price', 'exit_time', 'exit_price', 'pnl', 'exit_reason']
+                
+                if "Simulated" in result.parameters.get('backtest_mode', ''):
+                    display_columns = ['entry_time', 'simulated_option', 'quantity', 'invested_amount', 'entry_price', 'exit_time', 'exit_price', 'pnl', 'exit_reason', 'entry_index_price', 'exit_index_price']
+                else:
+                    display_columns = ['entry_time', 'simulated_option', 'quantity', 'invested_amount', 'entry_price', 'exit_time', 'exit_price', 'pnl', 'exit_reason']
+                
+                display_columns = [col for col in display_columns if col in trades_df.columns]
                 st.dataframe(trades_df[display_columns], width='stretch', height=400)
             else: st.info("No trades were executed during this backtest period.")
 
@@ -489,16 +579,23 @@ with tab3:
     # ---------------------------
     # Optimizer Section
     # ---------------------------
-    # ... (no change in this tab) ...
     st.subheader("🚀 Strategy Parameter Optimizer")
     st.markdown(f"This tool will run many backtests with random parameters for the **MTA Crossover** strategy on **{selected_index}** to find profitable combinations.")
-    st.warning(r"""
-    **Target Metrics:**
-    - **Sharpe Ratio:** $\geq 1.0$
-    - **Win Rate:** $> 50\%$
-    - **Total Trades:** $> 10$
-    - **Max Drawdown:** $< 10\%$
-    """)
+    st.info("Optimizer always runs in **Simulated Premium** mode for speed.")
+
+    # --- UPDATED: Target Metrics Inputs ---
+    st.markdown("#### 🎯 Target Metrics (For Filtering)")
+    tcol1, tcol2, tcol3, tcol4 = st.columns(4)
+    with tcol1:
+        target_sharpe = st.number_input("Min Sharpe Ratio", min_value=0.0, value=0.3, step=0.1, format="%.1f", key="opt_sharpe")
+    with tcol2:
+        target_win_rate = st.number_input("Min Win Rate (%)", min_value=0, max_value=100, value=40, step=1, key="opt_wr")
+    with tcol3:
+        target_trades = st.number_input("Min Total Trades", min_value=1, value=10, step=1, key="opt_trades")
+    with tcol4:
+        target_max_dd = st.number_input("Max Drawdown (%)", min_value=0, max_value=100, value=50, step=1, key="opt_dd")
+    
+    # --- UPDATED: param_space with new filters ---
     param_space = {
         'ema_short': (5, 15),
         'ema_long': (16, 40),
@@ -508,41 +605,57 @@ with tab3:
         'max_trades_per_day': (1, 10),
         'trade_start_time': (dt_time(9, 16), dt_time(11, 0)),
         'trade_end_time': (dt_time(13, 0), dt_time(15, 15)),
+        'simulated_premium_pct': (0.005, 0.015), # 0.5% to 1.5%
+        'simulated_delta': (0.4, 0.7),
+        
+        # --- NEW: Optimizer ranges for ADX/RSI ---
+        'rsi_period': (10, 30),
+        'rsi_overbought': (65, 80),
+        'rsi_oversold': (20, 35),
+        'adx_period': (10, 20),
+        'adx_threshold': (18, 30)
     }
+    
     def random_time(start, end):
         start_ts = int(start.hour * 60 + start.minute)
         end_ts = int(end.hour * 60 + end.minute)
         rand_ts = random.randint(start_ts, end_ts)
         return dt_time(rand_ts // 60, rand_ts % 60)
+    
     opt_col1, opt_col2 = st.columns(2)
     with opt_col1:
         num_iterations = st.number_input("Number of Iterations", min_value=10, max_value=1000, value=200, step=10)
+        find_all_matches = st.toggle("Find All Matches (Multi-Search)", value=True, help="If OFF, stop after the first match. If ON, run all iterations.")
     with opt_col2:
         opt_start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365*2), key="opt_start")
         opt_end_date = st.date_input("End Date", datetime.now(), key="opt_end")
+        
     if 'optimizer_results' not in st.session_state:
         st.session_state.optimizer_results = []
+        
     if st.button(f"🚀 RUN OPTIMIZER ({num_iterations} Iterations)", use_container_width=True, type="primary"):
         if not tester:
             st.error("Tester not initialized. Check Fyers credentials in Settings.")
         elif not fyers_manager or not fyers_manager.is_authenticated():
             st.error("Fyers API is not authenticated. Please go to the 'Settings' tab to generate a token.")
         else:
-            st.session_state.optimizer_running = True
+            st.session_state.optimizer_running = True 
             log_messages = []
             progress_bar = st.progress(0, text="Optimizer starting...")
             status_text = st.empty()
             try:
                 status_text.text(f"Fetching Fyers data for {selected_index} from {opt_start_date} to {opt_end_date}...")
-                data = tester.engine.data_manager.get_historical_data(
+                data = tester.engine.data_manager.get_historical_index_data(
                     selected_index, opt_start_date, opt_end_date, "5", is_backtest_log=True
                 )
                 if data is None or data.empty:
                     raise Exception("No data returned for optimizer.")
                 status_text.text(f"Data fetched ({len(data)} candles). Starting {num_iterations} iterations...")
                 st.session_state.optimizer_results = []
+                
                 for i in range(num_iterations):
                     try:
+                        # --- UPDATED: rand_params with new filters ---
                         rand_params = {
                             'ema_short': random.randint(param_space['ema_short'][0], param_space['ema_short'][1]),
                             'ema_long': random.randint(param_space['ema_long'][0], param_space['ema_long'][1]),
@@ -552,11 +665,24 @@ with tab3:
                             'max_trades_per_day': random.randint(param_space['max_trades_per_day'][0], param_space['max_trades_per_day'][1]),
                             'trade_start_time': random_time(param_space['trade_start_time'][0], param_space['trade_start_time'][1]),
                             'trade_end_time': random_time(param_space['trade_end_time'][0], param_space['trade_end_time'][1]),
+                            'simulated_premium_pct': round(random.uniform(param_space['simulated_premium_pct'][0], param_space['simulated_premium_pct'][1]), 4),
+                            'simulated_delta': round(random.uniform(param_space['simulated_delta'][0], param_space['simulated_delta'][1]), 2),
+                            
+                            # --- NEW: Randomize ADX/RSI params ---
+                            'use_rsi_filter': True,
+                            'rsi_period': random.randint(param_space['rsi_period'][0], param_space['rsi_period'][1]),
+                            'rsi_overbought': random.randint(param_space['rsi_overbought'][0], param_space['rsi_overbought'][1]),
+                            'rsi_oversold': random.randint(param_space['rsi_oversold'][0], param_space['rsi_oversold'][1]),
+                            'use_adx_filter': True,
+                            'adx_period': random.randint(param_space['adx_period'][0], param_space['adx_period'][1]),
+                            'adx_threshold': random.randint(param_space['adx_threshold'][0], param_space['adx_threshold'][1]),
+                            
                             'sl_mode': 'ATR', 
                             'initial_capital': 20000,
                         }
                         if rand_params['ema_short'] >= rand_params['ema_long']:
                             rand_params['ema_long'] = rand_params['ema_short'] + 1
+                        
                         result = tester.engine.run_backtest(
                             strategy_name=active_strategy_key,
                             symbol=selected_index,
@@ -565,16 +691,21 @@ with tab3:
                             interval="5",
                             silent=True, 
                             data=data.copy(),
+                            backtest_mode="Simulated Premium (Fast & Approx.)", # Always use fast mode
                             **rand_params
                         )
+
+                        # Use target metric inputs for check
                         is_good = (
-                            result.sharpe_ratio >= 0.5 and
-                            result.win_rate > 40 and
-                            result.total_trades > 10 and
-                            result.max_drawdown < 50
+                            result.sharpe_ratio >= target_sharpe and
+                            result.win_rate > target_win_rate and
+                            result.total_trades > target_trades and
+                            result.max_drawdown < target_max_dd
                         )
+                        
                         if is_good:
                             log_messages.append(f"✅ Found profitable result at iteration {i+1}!")
+                            # --- UPDATED: Add new params to results dict ---
                             st.session_state.optimizer_results.append({
                                 "Sharpe": result.sharpe_ratio,
                                 "Win Rate (%)": result.win_rate,
@@ -589,18 +720,35 @@ with tab3:
                                 "max_trades": rand_params['max_trades_per_day'],
                                 "start_time": rand_params['trade_start_time'].strftime("%H:%M"),
                                 "end_time": rand_params['trade_end_time'].strftime("%H:%M"),
+                                "sim_delta": rand_params['simulated_delta'],
+                                "sim_prem_pct": rand_params['simulated_premium_pct'],
+                                # --- NEW ---
+                                "RSI": rand_params['rsi_period'],
+                                "OB": rand_params['rsi_overbought'],
+                                "OS": rand_params['rsi_oversold'],
+                                "ADX": rand_params['adx_period'],
+                                "ADX_Th": rand_params['adx_threshold'],
                             })
+                            if not find_all_matches:
+                                log_messages.append(f"🛑 Multi-Search is OFF. Stopping at first match.")
+                                status_text.success("✅ Found first match! Stopping...")
+                                break 
                         else:
                             log_messages.append(f"Iteration {i+1}: Sharpe {result.sharpe_ratio:.2f}, WR {result.win_rate:.1f}%, Trades {result.total_trades}, DD {result.max_drawdown:.1f}%")
                     except Exception as e:
                         log_messages.append(f"❌ Iteration {i+1} failed: {e}")
                     progress_bar.progress((i + 1) / num_iterations, text=f"Optimizer running... {i+1}/{num_iterations}")
-                progress_bar.progress(1.0, text="Optimization complete!")
+                
+                if not find_all_matches and len(st.session_state.optimizer_results) > 0:
+                    progress_bar.progress(1.0, text="Optimizer stopped after first match.")
+                else:
+                    progress_bar.progress(1.0, text="Optimization complete!")
                 status_text.empty()
                 st.text_area("Optimization Log", value="\n".join(log_messages), height=300)
+
             finally:
-                st.session_state.optimizer_running = False
-                st.rerun()
+                st.session_state.optimizer_running = False 
+                st.rerun() 
 
     if st.session_state.optimizer_results:
         st.subheader("🏆 Optimizer Results")
@@ -618,7 +766,7 @@ with tab4:
     # ---------------------------
     # Settings Tab
     # ---------------------------
-    # ... (no change in this tab) ...
+    # ... (no change) ...
     st.subheader("🔑 Fyers API Settings")
     if not fyers_manager:
         st.error("Fyers Manager failed to initialize. Check your .env file.")

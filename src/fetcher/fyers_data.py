@@ -1,23 +1,25 @@
-# Modified: src/fetcher/fyers_data.py
-# - FIXED: Reverted symbols in FYERS_SYMBOL_MAP to include the
-#   '-INDEX' suffix, which is the correct format for the history API.
-
 import pandas as pd
 from fyers_apiv3 import fyersModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time, date
 from typing import Dict, Optional
 import os
 import json
+import time
+import calendar
 
 TOKEN_FILE = "fyers_token.json"
 
-# --- THIS IS THE FIX ---
-# The Fyers History API requires the '-INDEX' suffix for cash indices.
-FYERS_SYMBOL_MAP = {
+# Fyers symbol map for INDICES
+FYERS_INDEX_SYMBOL_MAP = {
     "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
     "NIFTY 50": "NSE:NIFTY50-INDEX"
 }
-# --- END OF FIX ---
+
+# Fyers symbol map for OPTIONS
+FYERS_OPTION_SYMBOL_MAP = {
+    "BANKNIFTY": "BANKNIFTY",
+    "NIFTY 50": "NIFTY"
+}
 
 class FyersDataManager:
     """
@@ -48,7 +50,20 @@ class FyersDataManager:
             token=self.access_token,
             log_path=os.path.join(os.getcwd(), "logs")
         )
-        print("Fyers model initialized with existing token.")
+        
+        # Validate token immediately upon init
+        if not self.is_authenticated():
+            print("⚠️ Initial token validation failed (Expired or Invalid). Clearing token file.")
+            self.fyers = None
+            self.access_token = None
+            if os.path.exists(TOKEN_FILE):
+                try:
+                    os.remove(TOKEN_FILE)
+                    print(f"Deleted invalid token file: {TOKEN_FILE}")
+                except Exception as e:
+                    print(f"Error deleting token file: {e}")
+        else:
+            print("✅ Fyers model initialized and validated with existing token.")
 
     def _load_token(self) -> Optional[str]:
         """Loads the access token from the JSON file."""
@@ -65,9 +80,7 @@ class FyersDataManager:
         return None
 
     def _create_session_model(self):
-        """
-        Creates a SessionModel for Fyers API v3.
-        """
+        """Creates a SessionModel for Fyers API v3."""
         print("[DEBUG] Attempting to create SessionModel with 'client_id'...")
         return fyersModel.SessionModel(
             client_id=self.app_id, 
@@ -95,17 +108,15 @@ class FyersDataManager:
         """
         print(f"[DEBUG] Received auth_code: {auth_code[:10]}...")
         if not self.app_session:
-            print("[DEBUG] No session found, creating new SessionModel for token generation...")
+            print("[DEBUG] No session found, creating new SessionModel...")
             try:
                 self.app_session = self._create_session_model()
             except Exception as e:
-                print(f"[DEBUG] CRITICAL ERROR creating SessionModel in generate_and_save_token: {e}")
+                print(f"[DEBUG] CRITICAL ERROR creating SessionModel: {e}")
                 return False
             
         try:
-            print("[DEBUG] Setting auth_code to session...")
             self.app_session.set_token(auth_code)
-            print("[DEBUG] Generating token...")
             response = self.app_session.generate_token()
             print(f"[DEBUG] Token generation response: {response}")
             
@@ -124,82 +135,187 @@ class FyersDataManager:
             return False
 
     def is_authenticated(self) -> bool:
-        """Checks if the fyers model is initialized."""
-        return self.fyers is not None
-
-    def get_historical_data(self, index_name: str, start_date: datetime, end_date: datetime, 
-                            interval: str = "5", is_backtest_log: bool = False) -> pd.DataFrame:
-        if not self.is_authenticated():
-            raise Exception("Fyers client is not authenticated. Please generate a token.")
-            
-        fyers_symbol = FYERS_SYMBOL_MAP.get(index_name)
+        """
+        Checks if the fyers model is initialized AND validates the token 
+        by making a lightweight API call (get_profile).
+        """
+        if self.fyers is None:
+            return False
         
+        try:
+            response = self.fyers.get_profile()
+            if response.get("s") == "ok" or response.get("code") == 200:
+                return True
+            else:
+                print(f"Token validation failed. API Response: {response}")
+                return False
+        except Exception as e:
+            print(f"Token validation exception (Network/API error): {e}")
+            return False
+
+    def get_historical_index_data(self, index_name: str, start_date: datetime, end_date: datetime, 
+                                  interval: str = "5", is_backtest_log: bool = False) -> pd.DataFrame:
+        """Fetches historical data for an INDEX."""
+        if not self.is_authenticated():
+            raise Exception("Fyers client is not authenticated.")
+            
+        fyers_symbol = FYERS_INDEX_SYMBOL_MAP.get(index_name)
         if not fyers_symbol:
-            raise Exception(f"Invalid index name: {index_name}. Not found in FYERS_SYMBOL_MAP.")
+            raise Exception(f"Invalid index name: {index_name}.")
             
         if is_backtest_log:
-            print(f"Fetching Fyers data for {fyers_symbol} from {start_date} to {end_date}...") # This will now print the correct symbol
-            
+            print(f"Fetching Fyers data for {fyers_symbol} from {start_date} to {end_date}...")
+        
         all_data = []
         current_start = start_date
         
         while current_start < end_date:
             current_end = min(current_start + timedelta(days=90), end_date)
-            
             data = {
                 "symbol": fyers_symbol,
-                "resolution": interval, 
-                "date_format": "1", 
+                "resolution": interval, "date_format": "1", 
                 "range_from": current_start.strftime("%Y-%m-%d"),
                 "range_to": current_end.strftime("%Y-%m-%d"),
                 "cont_flag": "1" 
             }
-
             try:
                 response = self.fyers.history(data=data)
             except Exception as e:
-                print(f"Fyers API error: {e}. Retrying once...")
+                print(f"Fyers API error (Index): {e}. Retrying once...")
+                time.sleep(1) # Wait 1 sec before retry
                 try:
                     response = self.fyers.history(data=data)
                 except Exception as e2:
-                    print(f"Fyers API error on retry: {e2}. Skipping this chunk.")
+                    print(f"Fyers API error on retry (Index): {e2}. Skipping chunk.")
                     current_start = current_end + timedelta(days=1)
                     continue
-
+            
             if response.get("s") == "ok" and response.get("candles"):
                 all_data.extend(response["candles"])
             elif response.get("s") == "no_data":
                 if is_backtest_log:
-                    print(f"No data for {fyers_symbol} from {current_start} to {current_end}")
+                    print(f"No index data for {fyers_symbol} from {current_start} to {current_end}")
             else:
-                print(f"Fyers API error: {response.get('message')}")
+                print(f"Fyers API error (Index): {response.get('message')}")
             
             current_start = current_end + timedelta(days=1)
 
         if not all_data:
-            print("No data fetched. Returning empty DataFrame.")
             return pd.DataFrame()
 
         df = pd.DataFrame(all_data)
         df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
-        
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
         df["timestamp"] = df["timestamp"].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
         df.set_index("timestamp", inplace=True)
-        
         df = df.between_time('09:15', '15:20')
         df.index = df.index.tz_localize(None)
         
         if is_backtest_log:
-            print(f"✅ Fetched and filtered {len(df)} total Fyers candles.")
-            
+            print(f"✅ Fetched and filtered {len(df)} total Index candles.")
         return df
+
+    # --- HELPER FUNCTIONS ---
+    def _get_last_wednesday_of_month(self, year: int, month: int) -> date:
+        """Finds the last Wednesday of a given month and year."""
+        last_day = calendar.monthrange(year, month)[1]
+        last_day_date = date(year, month, last_day)
+        last_day_weekday = last_day_date.weekday()
+        days_to_subtract = (last_day_weekday - 2 + 7) % 7
+        return last_day_date - timedelta(days=days_to_subtract)
+    
+    def _get_monthly_contract_symbol(self, underlying: str, expiry_date: date, strike: int, opt_type: str) -> str:
+        """Generates NEW format monthly symbol: {UNDERLYING}{YY}{MMM}{STRIKE}{TYPE}"""
+        yy = expiry_date.strftime('%y')
+        m = expiry_date.strftime('%b').upper() # e.g., NOV
+        return f"NSE:{underlying}{yy}{m}{strike}{opt_type}"
+
+    def _get_weekly_contract_symbol(self, underlying: str, expiry_date: date, strike: int, opt_type: str) -> str:
+        """Generates OLD format weekly symbol: {UNDERLYING}{YY}{M}{DD}{STRIKE}{TYPE}"""
+        yy = expiry_date.strftime('%y')
+        # Map for old single-char month codes
+        month_map = {1: '1', 2: '2', 3: '3', 4: '4', 5: '5', 6: '6',
+                     7: '7', 8: '8', 9: '9', 10: 'O', 11: 'N', 12: 'D'}
+        m = month_map[expiry_date.month]
+        dd = expiry_date.strftime('%d')
+        
+        # For BANKNIFTY specifically, older symbols used "BANKNIFTY" or "NIFTYBANK"?
+        # Based on your working example "NSE:BANKNIFTY20NOV25000PE", it seems underlying was consistent.
+        return f"NSE:{underlying}{yy}{m}{dd}{strike}{opt_type}"
+
+    def get_historical_option_data(self, index_name: str, trade_date: datetime, 
+                                   strike: int, opt_type: str, interval: str = "5") -> pd.DataFrame:
+        """
+        Fetches historical data for a specific OPTION contract for a SINGLE DAY.
+        Handles the transition from Weekly to Monthly contracts after Nov 13, 2024.
+        """
+        if not self.is_authenticated():
+            raise Exception("Fyers client is not authenticated.")
+
+        underlying = FYERS_OPTION_SYMBOL_MAP.get(index_name)
+        if not underlying:
+            raise Exception(f"Invalid option index name: {index_name}")
+        
+        discontinuation_date = date(2024, 11, 14)
+        trade_date_only = trade_date
+        fyers_symbol = ""
+        
+        if trade_date_only < discontinuation_date:
+            # --- OLD LOGIC (Weekly Expiry) ---
+            # Expiry was on WEDNESDAY (weekday 2) usually, sometimes Thursday
+            # For simplicity, let's assume Wednesday (weekday 2) as standard for BankNifty recent history
+            days_to_expiry = (2 - trade_date_only.weekday() + 7) % 7
+            expiry_date = trade_date_only + timedelta(days=days_to_expiry)
+            
+            if expiry_date == trade_date_only:
+                 expiry_date = trade_date_only + timedelta(days=7)
+                 
+            fyers_symbol = self._get_weekly_contract_symbol(underlying, expiry_date, strike, opt_type)
+        
+        else:
+            # --- NEW LOGIC (Monthly Expiry ONLY) ---
+            expiry_date = self._get_last_wednesday_of_month(trade_date_only.year, trade_date_only.month)
+            
+            if trade_date_only > expiry_date:
+                # Get next month's expiry
+                next_month_date = trade_date_only.replace(day=28) + timedelta(days=4)
+                expiry_date = self._get_last_wednesday_of_month(next_month_date.year, next_month_date.month)
+                
+            fyers_symbol = self._get_monthly_contract_symbol(underlying, expiry_date, strike, opt_type)
+        
+        # --- Fetch Data ---
+        data = {
+            "symbol": fyers_symbol,
+            "resolution": interval, "date_format": "1", 
+            "range_from": trade_date_only.strftime("%Y-%m-%d"),
+            "range_to": trade_date_only.strftime("%Y-%m-%d"),
+            "cont_flag": "1" 
+        }
+        
+        try:
+            response = self.fyers.history(data=data)
+            
+            if response.get("s") == "ok" and response.get("candles"):
+                df = pd.DataFrame(response["candles"])
+                df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+                df["timestamp"] = df["timestamp"].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+                df.set_index("timestamp", inplace=True)
+                df = df.between_time('09:15', '15:20')
+                df.index = df.index.tz_localize(None)
+                return df
+            else:
+                print(f"No option data for {fyers_symbol} on {trade_date_only}: {response.get('message')}")
+                return pd.DataFrame()
+        except Exception as e:
+            print(f"Fyers API error (Option): {e}")
+            return pd.DataFrame()
 
     def get_index_spot(self, index_name: str) -> float:
         if not self.is_authenticated():
             return 0.0
         
-        fyers_symbol = FYERS_SYMBOL_MAP.get(index_name)
+        fyers_symbol = FYERS_INDEX_SYMBOL_MAP.get(index_name)
         data = {"symbols": fyers_symbol}
         
         try:
