@@ -1,15 +1,11 @@
-kiteconnect==5.0.1
+# requirements.txt
+streamlit
 pandas
 numpy
-psycopg2-binary
-sqlalchemy
-streamlit
-requests
 python-dotenv
-uvicorn
 smartapi-python
 pyotp
-plotly>=5.0.0
-yfinance
 streamlit-autorefresh
-streamlit
+pandas-ta
+fyers-api3
+requests
