@@ -33,7 +33,7 @@ class AngelClient:
     Complete Angel Client with automated signal generation
     and REALISTIC intraday trading rules.
     """
-    def __init__(self, api_key=None, paper=True, index_name="BANKNIFTY"):
+    def __init__(self, api_key=None, paper=True, index_name="BANKNIFTY", fyers_manager=None, kite_client=None):
         self.paper = paper
         self.api_key = api_key or os.getenv("ANGEL_API_KEY")
         self.client_code = os.getenv("ANGEL_CLIENT_CODE")
@@ -43,6 +43,8 @@ class AngelClient:
         print(f"AngelClient initializing for: {self.index_name} ({self.yfinance_ticker})")
         
         self.market_data = RealMarketData()
+        self.fyers_manager = fyers_manager # Use Fyers for Index Data
+        self.kite_client = kite_client # Use Kite for Execution
         self.signal_storage = SignalStorage()
         
         # --- MODIFIED: Simplified strategy map ---
@@ -87,6 +89,7 @@ class AngelClient:
         self.daily_pnl = 0.0 
         self.signal_check_interval = 30 
         self.trade_lock = threading.Lock()
+        self.last_signal_timestamp = None # Initialize here too
 
     def check_new_day(self):
         today = datetime.now(IST).date()
@@ -96,6 +99,7 @@ class AngelClient:
             self.daily_pnl = 0.0 
             self.skip_today = False
             self.today_trades_count = 0 # <-- NEW: Reset trade count
+            self.last_signal_timestamp = None # Track the last processed candle timestamp
 
     # --- MODIFIED: Added new params ---
     def set_trading_parameters(self, max_daily_loss=None, max_trades=None, start_time=None, end_time=None):
@@ -121,13 +125,90 @@ class AngelClient:
             print(f"❌ Error: Tried to set unknown strategy '{strategy_name}'")
 
     # ----------- Market Data Methods (no change) -----------
-    def get_5m_historical_data(self) -> pd.DataFrame:
-        try: return self.market_data.get_index_historical(self.index_name, days=7)
-        except Exception as e: print(f"Error getting 5m data: {e}"); return pd.DataFrame()
+    # ----------- Market Data Methods (no change) -----------
+    def get_multi_timeframe_data(self) -> pd.DataFrame:
+        """
+        Fetches 5m, 15m, and 1h data from Fyers and merges them.
+        This matches the logic in BacktestEngine.prepare_data.
+        """
+        if not self.fyers_manager:
+            print("❌ Fyers Manager not initialized in AngelClient.")
+            return pd.DataFrame()
+            
+        try:
+            end_date = datetime.now(IST)
+            start_date = end_date - timedelta(days=5) # Fetch last 5 days
+            
+            # 1. Fetch Base Data (5m)
+            df_5m = self.fyers_manager.get_historical_index_data(self.index_name, start_date, end_date, "5")
+            if df_5m is None or df_5m.empty: return pd.DataFrame()
+            
+            # 2. Fetch 15m Data
+            df_15m = self.fyers_manager.get_historical_index_data(self.index_name, start_date, end_date, "15")
+            
+            # 3. Fetch 1h Data
+            df_1h = self.fyers_manager.get_historical_index_data(self.index_name, start_date, end_date, "60")
+            
+            # 4. Calculate Indicators on Higher Timeframes BEFORE merging
+            # Get params from active strategy
+            params = self.strategies[self.active_strategy_name].parameters
+            ema_short = params.get('ema_short', 9)
+            ema_long = params.get('ema_long', 15)
+            
+            if df_15m is not None and not df_15m.empty:
+                df_15m['ema_short_15m'] = df_15m['close'].ewm(span=ema_short, adjust=False).mean()
+                df_15m['ema_long_15m'] = df_15m['close'].ewm(span=ema_long, adjust=False).mean()
+                
+            if df_1h is not None and not df_1h.empty:
+                df_1h['ema_short_1h'] = df_1h['close'].ewm(span=ema_short, adjust=False).mean()
+                df_1h['ema_long_1h'] = df_1h['close'].ewm(span=ema_long, adjust=False).mean()
+                
+            # 5. Merge Higher Timeframes to Base (5m)
+            df_5m['15m_timestamp'] = df_5m.index.floor('15min')
+            df_5m = pd.merge(df_5m, df_15m[['ema_short_15m', 'ema_long_15m']], left_on='15m_timestamp', right_index=True, how='left')
+            
+            # Fix for 1h candles starting at 09:15
+            df_5m['1h_timestamp'] = (df_5m.index - pd.Timedelta(minutes=15)).floor('1h') + pd.Timedelta(minutes=15)
+            df_5m = pd.merge(df_5m, df_1h[['ema_short_1h', 'ema_long_1h']], left_on='1h_timestamp', right_index=True, how='left')
+            
+            # Forward fill to propagate signals
+            df_5m.ffill(inplace=True)
+            
+            return df_5m
+            
+        except Exception as e:
+            print(f"Error fetching multi-timeframe data: {e}")
+            return pd.DataFrame()
 
     def get_index_ltp(self) -> float:
-        try: return self.market_data.get_index_spot(self.index_name)
-        except Exception as e: raise Exception(f"Failed to get {self.index_name} LTP: {e}")
+        """
+        Fetches the latest price of the index from Fyers.
+        """
+        if not self.fyers_manager:
+            return 0.0
+        return self.fyers_manager.get_index_spot(self.index_name)
+
+    def get_5m_historical_data(self) -> pd.DataFrame:
+        """
+        Fetches 5m historical data for the index (last 5 days).
+        Used for calculating EMAs in the UI.
+        """
+        if not self.fyers_manager:
+            print("❌ Fyers Manager not initialized in AngelClient.")
+            return pd.DataFrame()
+            
+        try:
+            end_date = datetime.now(IST)
+            start_date = end_date - timedelta(days=5)
+            
+            df_5m = self.fyers_manager.get_historical_index_data(self.index_name, start_date, end_date, "5")
+            if df_5m is None or df_5m.empty:
+                return pd.DataFrame()
+                
+            return df_5m
+        except Exception as e:
+            print(f"Error fetching 5m historical data: {e}")
+            return pd.DataFrame()
 
     def get_option_chain(self, expiry: str = "") -> List[Dict[str, Any]]:
         try: return self.market_data.get_banknifty_option_chain(self.index_name, expiry_date=expiry)
@@ -162,6 +243,17 @@ class AngelClient:
                 return [] # Outside of allowed new trade window
             if self.today_trades_count >= self.max_trades_per_day:
                 return [] # Max trades hit
+            
+            # --- NEW: 5-Minute Alignment Check ---
+            # User requested to only hit API after 5 min candle close.
+            # We check if we are in the first minute of a 5-minute block (e.g. 9:15, 9:20).
+            # Since bot_loop runs every 30s, this allows us to catch the :00 or :30 mark of the target minute.
+            # FIX: Only allow execution in the first 30 seconds to prevent double runs (at :00 and :30)
+            if now_time.minute % 5 != 0 or now_time.second >= 30:
+                # print(f"Skipping signal check (Not a 5-min mark): {now_time.strftime('%H:%M:%S')}")
+                return []
+            
+            print(f"[DEBUG] Starting Signal Generation at {now_time.strftime('%H:%M:%S')}")
             # --- END MODIFIED ---
             
             if self.skip_today: return []
@@ -169,16 +261,30 @@ class AngelClient:
             if len(self.positions_map) > 0: return [] 
             
             try:
-                historical_data = self.get_5m_historical_data()
+                historical_data = self.get_multi_timeframe_data()
                 if historical_data.empty:
-                    print("No historical data, cannot generate signals."); return []
+                    print("No historical data (Fyers), cannot generate signals."); return []
                 
                 active_strategy = self.strategies[self.active_strategy_name]
                 signal = active_strategy.generate_live_signal(historical_data)
                 
                 if signal:
-                    print(f"✅ Strategy Signal Generated: {signal['reason']}")
+                    # --- NEW: Check if we already processed this candle ---
+                    signal_ts = signal.get('timestamp')
+                    if signal_ts and self.last_signal_timestamp and signal_ts <= self.last_signal_timestamp:
+                        # print(f"Skipping duplicate signal for candle {signal_ts}")
+                        return []
+                    
+                    print(f"✅ Strategy Signal Generated: {signal['reason']} (Candle: {signal_ts})")
                     result = self.execute_strategy_trade(signal)
+                    
+                    # Update last processed timestamp if trade was attempted (success or fail, we acted on it)
+                    # Actually, only if success? No, if we fail (e.g. margin), we shouldn't retry every 30s.
+                    # We should mark this candle as 'processed'.
+                    if signal_ts:
+                        self.last_signal_timestamp = signal_ts
+                        
+                    return result
                     if result.get('status'):
                         print(f"✅ Trade Executed: {result.get('message')}")
                     else:
@@ -232,11 +338,51 @@ class AngelClient:
                 stop_loss_price = round(option_ltp - sl_points, 1)
                 take_profit_price = round(option_ltp + tp_points, 1)
 
-            result = self.place_order(
-                tradingsymbol=tradingsymbol, transaction_type="BUY", quantity=quantity,
-                price=option_ltp, stop_loss=stop_loss_price, take_profit=take_profit_price,
-                expiry=expiry 
-            )
+            if self.paper:
+                result = self.place_order(
+                    tradingsymbol=tradingsymbol, transaction_type="BUY", quantity=quantity,
+                    price=option_ltp, stop_loss=stop_loss_price, take_profit=take_profit_price,
+                    expiry=expiry 
+                )
+            else:
+                # REAL TRADING with GTT OCO
+                if self.kite_client:
+                    print(f"🚀 Placing REAL GTT OCO Order for {tradingsymbol}...")
+                    # 1. Place Market Entry Order
+                    entry_result = self.kite_client.place_order(
+                        tradingsymbol=tradingsymbol,
+                        exchange="NFO",
+                        transaction_type="BUY",
+                        quantity=quantity,
+                        product_type="MIS", # Intraday
+                        price=None, # Market Order
+                        tag="bot_entry"
+                    )
+                    
+                    if entry_result['status'] == 'success':
+                        print(f"✅ Entry Order Placed: {entry_result['order_id']}")
+                        # 2. Place GTT OCO for SL/TP
+                        gtt_result = self.kite_client.place_gtt_oco(
+                            tradingsymbol=tradingsymbol,
+                            exchange="NFO",
+                            transaction_type="BUY", # Entry was BUY, so GTT handles exit (SELL) internally
+                            quantity=quantity,
+                            product_type="MIS",
+                            price=option_ltp, # Current price for reference
+                            stop_loss_price=stop_loss_price,
+                            target_price=take_profit_price
+                        )
+                        if gtt_result['status'] == 'success':
+                            print(f"✅ GTT OCO Placed: {gtt_result['trigger_id']}")
+                            result = {"status": True, "message": "Real Trade & GTT Placed", "data": entry_result}
+                        else:
+                            print(f"❌ GTT Failed: {gtt_result.get('message')}")
+                            result = {"status": True, "message": "Entry Success but GTT Failed!", "data": entry_result} # Trade is open, but no SL!
+                    else:
+                        print(f"❌ Entry Failed: {entry_result.get('message')}")
+                        result = {"status": False, "message": f"Entry Failed: {entry_result.get('message')}"}
+                else:
+                    result = {"status": False, "message": "Kite Client not initialized for Real Trading."}
             
             # --- NEW: Increment trade count on success ---
             if result.get('status'):
@@ -269,7 +415,7 @@ class AngelClient:
             
         try:
             spot_price = self.get_index_ltp()
-            historical_data = self.get_5m_historical_data()
+            historical_data = self.get_multi_timeframe_data()
             active_strategy = self.strategies[self.active_strategy_name]
             hist_df = active_strategy.calculate_indicators(historical_data, **active_strategy.parameters)
             if hist_df is None or hist_df.empty:
@@ -365,19 +511,54 @@ class AngelClient:
             except Exception as e:
                 return {"status": False, "message": f"Paper order failed: {e}"}
         else:
-            print("--- REAL TRADING IS NOT IMPLEMENTED ---")
-            return {"status": False, "message": "Real trading logic is not implemented."}
+            # REAL TRADING
+            if self.kite_client:
+                return self.kite_client.place_order(
+                    tradingsymbol=tradingsymbol,
+                    exchange="NFO",
+                    transaction_type=transaction_type,
+                    quantity=quantity,
+                    product_type="MIS",
+                    price=price
+                )
+            else:
+                print("--- REAL TRADING IS NOT IMPLEMENTED OR KITE CLIENT MISSING ---")
+                return {"status": False, "message": "Real trading logic is not implemented or Kite Client missing."}
 
     def get_positions(self) -> List[Dict[str, Any]]:
-        # ... (no change) ...
-        positions = []
-        for symbol, pos in self.positions_map.items():
-            try:
-                current_price = self.get_option_ltp(symbol, expiry_hint=pos.get('expiry'))
-                unrealized_pnl = (current_price - pos["avg_price"]) * pos["qty"]
-                positions.append({"tradingsymbol": symbol, "qty": pos["qty"], "avg_price": round(pos["avg_price"], 2), "current_price": round(current_price, 2), "unrealized_pnl": round(unrealized_pnl, 2), "sl": pos.get('stop_loss'), "tp": pos.get('take_profit')})
-            except: continue
-        return positions
+        if self.paper:
+            positions = []
+            for symbol, pos in self.positions_map.items():
+                try:
+                    current_price = self.get_option_ltp(symbol, expiry_hint=pos.get('expiry'))
+                    unrealized_pnl = (current_price - pos["avg_price"]) * pos["qty"]
+                    positions.append({"tradingsymbol": symbol, "qty": pos["qty"], "avg_price": round(pos["avg_price"], 2), "current_price": round(current_price, 2), "unrealized_pnl": round(unrealized_pnl, 2), "sl": pos.get('stop_loss'), "tp": pos.get('take_profit')})
+                except: continue
+            return positions
+        else:
+            # REAL TRADING
+            if self.kite_client:
+                try:
+                    kite_pos = self.kite_client.get_positions()
+                    # We focus on 'net' positions which show current open positions
+                    net_positions = kite_pos.get('net', [])
+                    mapped_positions = []
+                    for p in net_positions:
+                        if p['quantity'] != 0:
+                            mapped_positions.append({
+                                "tradingsymbol": p['tradingsymbol'],
+                                "qty": p['quantity'],
+                                "avg_price": p['average_price'],
+                                "current_price": p['last_price'],
+                                "unrealized_pnl": p['pnl'],
+                                "sl": 0, # Not available directly from Kite positions
+                                "tp": 0
+                            })
+                    return mapped_positions
+                except Exception as e:
+                    print(f"Error fetching Kite positions: {e}")
+                    return []
+            return []
     def get_trade_history(self) -> List[Dict[str, Any]]: return self.trade_history
     def get_daily_pnl(self) -> float: return self.daily_pnl
     def get_portfolio_value(self) -> Dict[str, float]:

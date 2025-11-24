@@ -6,18 +6,25 @@
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, date
 from typing import List, Dict, Any, Optional
 import json
 import streamlit as st
 from zoneinfo import ZoneInfo 
 import pandas_ta as ta
+import calendar
 
 # --- Import FyersDataManager ---
 try:
     from fetcher.fyers_data import FyersDataManager
 except ImportError:
     print("CRITICAL: backtest.py failed to import 'from fetcher.fyers_data import FyersDataManager'")
+    pass
+
+try:
+    from ml.predictor import PricePredictor
+except ImportError:
+    print("Warning: Could not import PricePredictor in backtest.py")
     pass
 
 class BacktestResult:
@@ -47,30 +54,32 @@ class MultiTimeframeStrategy(StrategyTemplate):
     def __init__(self):
         super().__init__(
             name="MTA (5m) EMA Crossover", 
-            description="Trades 5m EMA Crossover, aligned with 15m/1h trends. Includes ADX trend strength and RSI momentum filters."
+            description="Trades 5m EMA Crossover, aligned with 15m/1h trends. Fetches 5m/15m/1h data directly from Fyers."
         )
         self.parameters = {
-            'ema_short': 9, 'ema_long': 15, 'atr_period': 30,
+            'ema_short': 9, 'ema_long': 15,
+            'atr_period': 14, 'adx_period': 14, 'rsi_period': 5,
             
-            # --- NEW: ADX Filter Params ---
-            'use_adx_filter': True,
-            'adx_period': 14,
-            'adx_threshold': 20, # Only trade if ADX is above this
+            # Filters (Enabled by Default)
+            'use_adx_filter': False, 'adx_threshold': 20,
+            'use_rsi_filter': True, 'rsi_overbought': 70, 'rsi_oversold': 30,
             
-            # --- NEW: RSI Filter Params ---
-            'use_rsi_filter': True,
-            'rsi_period': 14,
-            'rsi_overbought': 70, # Don't BUY if RSI > 70
-            'rsi_oversold': 30,  # Don't SELL if RSI < 30
+            # --- NEW: Expiry Filter ---
+            'skip_last_week_expiry': True,
+            
+            # --- NEW: Candle Size Filter ---
+            'use_candle_size_filter': True,
+            'candle_size_period': 10,
+            'candle_size_factor': 1.0,
             
             # Risk params
             'lot_size': 35, 'min_investment': 10000, 
             'max_daily_loss': 2000, 'max_trades_per_day': 10,
-            'trade_start_time': time(9, 30), 'trade_end_time': time(15, 0),
+            'trade_start_time': time(9, 30), 'trade_end_time': time(14, 0),
             
             # SL/TP
             'sl_mode': 'ATR', 'invested_value_sl_pct': 5.0, 'tp_sl_ratio': 2.0,
-            'atr_tp_multiplier': 2.0, 'atr_sl_multiplier': 1.0,
+            'atr_tp_multiplier': 4.0, 'atr_sl_multiplier': 1.4,
             
             # Sim params
             'simulated_premium_pct': 0.008, 'simulated_delta': 0.5,
@@ -78,17 +87,100 @@ class MultiTimeframeStrategy(StrategyTemplate):
         self.IST = ZoneInfo('Asia/Kolkata')
         self.current_day = None
         self.daily_trend = 'NEUTRAL'
+        self.trend_predictor = None # AI Trend Model
 
-    def _resample_data(self, df_5min: pd.DataFrame, rule: str) -> pd.DataFrame:
-        df_resampled = df_5min.resample(rule).agg({
-            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-        }).dropna()
-        return df_resampled
+    def set_trend_predictor(self, predictor):
+        self.trend_predictor = predictor
 
-    def calculate_indicators(self, data_5min: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    def _get_last_wednesday(self, year: int, month: int) -> date:
+        """Finds the last Wednesday of a given month and year."""
+        last_day = calendar.monthrange(year, month)[1]
+        last_day_date = date(year, month, last_day)
+        last_day_weekday = last_day_date.weekday() # Mon=0, Wed=2
+        days_to_subtract = (last_day_weekday - 2 + 7) % 7
+        return last_day_date - timedelta(days=days_to_subtract)
+
+    def _is_last_week_of_expiry(self, current_dt: datetime) -> bool:
+        """
+        Checks if the date is within the restricted period before expiry.
+        - Monthly Expiry: Skip last 7 days (Thu-Wed).
+        - Weekly Expiry: Skip last 2 days (Tue-Wed).
+        """
+        current_date = current_dt.date()
+        
+        # 1. Find the next Wednesday (Expiry)
+        # If today is Wed (2), days_ahead=0. If Thu (3), days_ahead=6.
+        days_ahead = (2 - current_date.weekday() + 7) % 7
+        next_expiry = current_date + timedelta(days=days_ahead)
+        
+        # 2. Check if it's a Monthly Expiry
+        last_wed_of_month = self._get_last_wednesday(next_expiry.year, next_expiry.month)
+        is_monthly = (next_expiry == last_wed_of_month)
+        
+        if is_monthly:
+            # Monthly Rule: Skip last 7 days (Thu before to Wed of expiry)
+            # This means if we are within 6 days of expiry (Thu=6, Fri=5... Wed=0)
+            return days_ahead <= 6
+        else:
+            # Weekly Rule: Skip last 2 days (Tue & Wed)
+            # Tue=1, Wed=0
+            return days_ahead <= 1
+
+    def prepare_data(self, engine: 'BacktestEngine', symbol: str, start_date: datetime, end_date: datetime, interval: str, **kwargs) -> pd.DataFrame:
+        """
+        Fetches 5m, 15m, and 1h data separately and merges them.
+        """
+        print(f"[DEBUG] MTA Strategy prepare_data called for {symbol} with interval {interval}")
+        # 1. Fetch Base Data (5m) - Force 5m interval
+        if interval != "5":
+            print(f"Warning: MTA Strategy requires 5m base interval. Overriding {interval} to 5.")
+            interval = "5"
+            
+        df_5m = engine.data_manager.get_historical_index_data(symbol, start_date, end_date, "5", is_backtest_log=True)
+        if df_5m is None or df_5m.empty: return None
+        
+        # 2. Fetch 15m Data
+        df_15m = engine.data_manager.get_historical_index_data(symbol, start_date, end_date, "15", is_backtest_log=True)
+        
+        # 3. Fetch 1h Data
+        df_1h = engine.data_manager.get_historical_index_data(symbol, start_date, end_date, "60", is_backtest_log=True)
+        
+        # 4. Calculate Indicators on Higher Timeframes BEFORE merging
+        # This is crucial because merging first would mess up the rolling calculations
+        ema_short = kwargs.get('ema_short', 9)
+        ema_long = kwargs.get('ema_long', 15)
+        
+        if df_15m is not None and not df_15m.empty:
+            df_15m['ema_short_15m'] = df_15m['close'].ewm(span=ema_short, adjust=False).mean()
+            df_15m['ema_long_15m'] = df_15m['close'].ewm(span=ema_long, adjust=False).mean()
+            
+        if df_1h is not None and not df_1h.empty:
+            df_1h['ema_short_1h'] = df_1h['close'].ewm(span=ema_short, adjust=False).mean()
+            df_1h['ema_long_1h'] = df_1h['close'].ewm(span=ema_long, adjust=False).mean()
+            
+        # 5. Merge Higher Timeframes to Base (5m)
+        # We align by timestamp. 15m/1h data will be sparse on the 5m index.
+        # We use ffill() to propagate the last known 15m/1h value forward.
+        
+        df_5m['15m_timestamp'] = df_5m.index.floor('15min')
+        df_5m = pd.merge(df_5m, df_15m[['ema_short_15m', 'ema_long_15m']], left_on='15m_timestamp', right_index=True, how='left')
+        
+        # Fix for 1h candles starting at 09:15 (NSE Market Hours)
+        # Logic: Shift back 15m -> floor to hour -> shift forward 15m
+        # e.g. 09:20 -> 09:05 -> 09:00 -> 09:15
+        df_5m['1h_timestamp'] = (df_5m.index - pd.Timedelta(minutes=15)).floor('1h') + pd.Timedelta(minutes=15)
+        df_5m = pd.merge(df_5m, df_1h[['ema_short_1h', 'ema_long_1h']], left_on='1h_timestamp', right_index=True, how='left')
+        
+        # Forward fill to propagate signals
+        df_5m.ffill(inplace=True)
+        df_5m.dropna(inplace=True) # Remove initial rows with NaNs
+        
+        return df_5m
+
+    def calculate_indicators(self, data: pd.DataFrame, **kwargs) -> pd.DataFrame:
         try:
-            df_5m = data_5min.copy()
-            if df_5m.empty: return None
+            df = data.copy()
+            if df.empty: return None
             
             # Get periods from kwargs or defaults
             ema_short_period = kwargs.get('ema_short', self.parameters['ema_short'])
@@ -97,54 +189,46 @@ class MultiTimeframeStrategy(StrategyTemplate):
             rsi_period = kwargs.get('rsi_period', self.parameters['rsi_period'])
             adx_period = kwargs.get('adx_period', self.parameters['adx_period'])
             
-            # EMAs
-            df_5m['ema_short'] = df_5m['close'].ewm(span=ema_short_period, adjust=False).mean()
-            df_5m['ema_long'] = df_5m['close'].ewm(span=ema_long_period, adjust=False).mean()
+            # --- NEW: Candle Size Params ---
+            candle_size_period = kwargs.get('candle_size_period', self.parameters['candle_size_period'])
+            
+            # --- 1. Calculate Indicators on Base (5m) ---
+            df['ema_short'] = df['close'].ewm(span=ema_short_period, adjust=False).mean()
+            df['ema_long'] = df['close'].ewm(span=ema_long_period, adjust=False).mean()
             
             # ATR
-            df_5m.ta.atr(length=atr_period, append=True)
+            df.ta.atr(length=atr_period, append=True)
             atr_col_name = f'ATRr_{atr_period}'
-            if atr_col_name in df_5m.columns:
-                df_5m.rename(columns={atr_col_name: 'atr'}, inplace=True)
+            if atr_col_name in df.columns:
+                df.rename(columns={atr_col_name: 'atr'}, inplace=True)
             
-            # --- NEW: Calculate RSI ---
-            df_5m.ta.rsi(length=rsi_period, append=True)
+            # RSI
+            df.ta.rsi(length=rsi_period, append=True)
             rsi_col_name = f'RSI_{rsi_period}'
-            if rsi_col_name in df_5m.columns:
-                df_5m.rename(columns={rsi_col_name: 'rsi'}, inplace=True)
+            if rsi_col_name in df.columns:
+                df.rename(columns={rsi_col_name: 'rsi'}, inplace=True)
 
-            # --- NEW: Calculate ADX ---
-            df_5m.ta.adx(length=adx_period, append=True)
+            # ADX
+            df.ta.adx(length=adx_period, append=True)
             adx_col_name = f'ADX_{adx_period}'
-            if adx_col_name in df_5m.columns:
-                df_5m.rename(columns={adx_col_name: 'adx'}, inplace=True)
+            if adx_col_name in df.columns:
+                df.rename(columns={adx_col_name: 'adx'}, inplace=True)
             
-            # (We don't need DMP/DMN, so we can drop them if they exist)
-            df_5m.drop(columns=[f'DMP_{adx_period}', f'DMN_{adx_period}'], errors='ignore', inplace=True)
-
-            df_5m.bfill(inplace=True) # Fill NaNs from indicators
-
-            # Resample for 15m and 1h
-            df_15m = self._resample_data(df_5m, '15min')
-            if not df_15m.empty:
-                df_15m['ema_short_15m'] = df_15m['close'].ewm(span=ema_short_period, adjust=False).mean()
-                df_15m['ema_long_15m'] = df_15m['close'].ewm(span=ema_long_period, adjust=False).mean()
-            else: df_15m = pd.DataFrame(columns=['ema_short_15m', 'ema_long_15m'])
-
-            df_1h = self._resample_data(df_5m, '1h')
-            if not df_1h.empty:
-                df_1h['ema_short_1h'] = df_1h['close'].ewm(span=ema_short_period, adjust=False).mean()
-                df_1h['ema_long_1h'] = df_1h['close'].ewm(span=ema_long_period, adjust=False).mean()
-            else: df_1h = pd.DataFrame(columns=['ema_short_1h', 'ema_long_1h'])
-
-            # Merge back to 5m frame
-            df_5m['15m_timestamp'] = df_5m.index.floor('15min')
-            df_5m = pd.merge(df_5m, df_15m[['ema_short_15m', 'ema_long_15m']], left_on='15m_timestamp', right_index=True, how='left')
-            df_5m['1h_timestamp'] = df_5m.index.floor('1h')
-            df_5m = pd.merge(df_5m, df_1h[['ema_short_1h', 'ema_long_1h']], left_on='1h_timestamp', right_index=True, how='left')
+            df.drop(columns=[f'DMP_{adx_period}', f'DMN_{adx_period}'], errors='ignore', inplace=True)
             
-            df_5m.ffill(inplace=True); df_5m.bfill(inplace=True)
-            return df_5m
+            # --- NEW: Candle Size Indicators ---
+            df['candle_range'] = df['high'] - df['low']
+            df['avg_candle_range'] = df['candle_range'].rolling(window=candle_size_period).mean()
+
+            # Note: Higher timeframe indicators (ema_short_15m, etc.) are already present 
+            # because they were added in prepare_data. We just need to ensure they exist.
+            required_cols = ['ema_short_15m', 'ema_long_15m', 'ema_short_1h', 'ema_long_1h']
+            for col in required_cols:
+                if col not in df.columns:
+                    # Fallback if data wasn't prepared correctly (e.g. in live mode later)
+                    df[col] = np.nan 
+
+            return df
         except Exception as e:
             print(f"Error calculating indicators: {e}"); return None
 
@@ -156,18 +240,41 @@ class MultiTimeframeStrategy(StrategyTemplate):
         df_5m['strike'] = 0
         df_5m['opt_type'] = ""
         
+        # --- NEW: AI Trend Filter Integration ---
+        if self.trend_predictor:
+            try:
+                # Resample to 1h for AI (or use existing 1h columns if possible, but predictor expects raw OHLCV)
+                # Since we have 1h data merged, we can try to reconstruct or just resample 5m -> 1h
+                # For simplicity and robustness, we resample the 5m data to 1h
+                df_1h_ai = self._resample_data(df_5m, '1h')
+                if not df_1h_ai.empty:
+                    trend_results, _ = self.trend_predictor.predict_trend(df_1h_ai)
+                    # Merge predictions back to 5m
+                    df_5m['1h_timestamp'] = df_5m.index.floor('1h')
+                    df_5m = pd.merge(df_5m, trend_results[['Predicted']], left_on='1h_timestamp', right_index=True, how='left')
+                    df_5m.rename(columns={'Predicted': 'ai_trend'}, inplace=True)
+                    df_5m['ai_trend'] = df_5m['ai_trend'].ffill()
+            except Exception as e:
+                print(f"AI Trend Prediction failed: {e}")
+        
         # --- NEW: Get filter params from kwargs ---
         use_adx_filter = kwargs.get('use_adx_filter', self.parameters['use_adx_filter'])
         adx_threshold = kwargs.get('adx_threshold', self.parameters['adx_threshold'])
         use_rsi_filter = kwargs.get('use_rsi_filter', self.parameters['use_rsi_filter'])
         rsi_overbought = kwargs.get('rsi_overbought', self.parameters['rsi_overbought'])
         rsi_oversold = kwargs.get('rsi_oversold', self.parameters['rsi_oversold'])
+        skip_last_week_expiry = kwargs.get('skip_last_week_expiry', self.parameters['skip_last_week_expiry'])
+        
+        # --- NEW: Candle Size Filter Params ---
+        use_candle_size_filter = kwargs.get('use_candle_size_filter', self.parameters['use_candle_size_filter'])
+        candle_size_factor = kwargs.get('candle_size_factor', self.parameters['candle_size_factor'])
         
         min_periods = max(
             self.parameters['ema_long'], 
             kwargs.get('atr_period', 14),
             kwargs.get('adx_period', 14),
-            kwargs.get('rsi_period', 14)
+            kwargs.get('rsi_period', 14),
+            kwargs.get('candle_size_period', 20)
         ) + 1
         
         if min_periods >= len(df_5m):
@@ -176,6 +283,12 @@ class MultiTimeframeStrategy(StrategyTemplate):
             
         for i in range(min_periods, len(df_5m)):
             current = df_5m.iloc[i]; prev = df_5m.iloc[i-1]
+            current_dt = df_5m.index[i]
+            
+            # --- NEW: Skip Last Week of Expiry Filter ---
+            if skip_last_week_expiry:
+                if self._is_last_week_of_expiry(current_dt):
+                    continue # Skip signal generation for this candle
             
             if pd.isna(current['ema_short']) or pd.isna(current['ema_short_15m']) or pd.isna(current['ema_short_1h']) or pd.isna(prev['ema_short']):
                 continue
@@ -185,35 +298,54 @@ class MultiTimeframeStrategy(StrategyTemplate):
                 if pd.isna(current['adx']) or current['adx'] < adx_threshold:
                     continue # Market is not trending, skip signal
             
-            # Trend conditions (unchanged)
+            # --- NEW: Candle Size Filter ---
+            if use_candle_size_filter:
+                if pd.isna(current['avg_candle_range']) or current['candle_range'] < (current['avg_candle_range'] * candle_size_factor):
+                    continue # Candle is too small, skip signal
+            
+            # Trend conditions
             is_1h_uptrend = current['ema_short_1h'] > current['ema_long_1h']
             is_1h_downtrend = current['ema_short_1h'] < current['ema_long_1h']
             is_15m_uptrend = current['ema_short_15m'] > current['ema_long_15m']
             is_15m_downtrend = current['ema_short_15m'] < current['ema_long_15m']
+            is_5m_uptrend = current['ema_short'] > current['ema_long'] # This is the 5m trend, not 5m crossover
+            is_5m_downtrend = current['ema_short'] < current['ema_long'] # This is the 5m trend, not 5m crossover
             
-            # Signal conditions (unchanged)
+            # Signal conditions (5m Crossover)
             is_5m_bullish_cross = (prev['ema_short'] <= prev['ema_long']) and (current['ema_short'] > current['ema_long'])
             is_5m_bearish_cross = (prev['ema_short'] >= prev['ema_long']) and (current['ema_short'] < current['ema_long'])
             
             strike = int(round(current['close'] / 100.0) * 100)
 
-            # BUY Signal
+            # BUY Signal (All timeframes aligned)
             if is_5m_bullish_cross and is_15m_uptrend and is_1h_uptrend:
                 # --- NEW: RSI Overbought Filter ---
                 if use_rsi_filter:
                     if not pd.isna(current['rsi']) and current['rsi'] > rsi_overbought:
                         continue # Market is overbought, skip BUY
                 
+                # --- NEW: AI Trend Filter ---
+                if self.trend_predictor and 'ai_trend' in df_5m.columns:
+                    ai_trend = current['ai_trend']
+                    if not pd.isna(ai_trend) and ai_trend == 0: # AI predicts DOWN
+                         continue
+                
                 df_5m.loc[df_5m.index[i], 'signal'] = 1
                 df_5m.loc[df_5m.index[i], 'strike'] = strike
                 df_5m.loc[df_5m.index[i], 'opt_type'] = "CE"
             
-            # SELL Signal
+            # SELL Signal (All timeframes aligned)
             elif is_5m_bearish_cross and is_15m_downtrend and is_1h_downtrend:
                 # --- NEW: RSI Oversold Filter ---
                 if use_rsi_filter:
                     if not pd.isna(current['rsi']) and current['rsi'] < rsi_oversold:
                         continue # Market is oversold, skip SELL
+
+                # --- NEW: AI Trend Filter ---
+                if self.trend_predictor and 'ai_trend' in df_5m.columns:
+                    ai_trend = current['ai_trend']
+                    if not pd.isna(ai_trend) and ai_trend == 1: # AI predicts UP
+                         continue
                 
                 df_5m.loc[df_5m.index[i], 'signal'] = -1
                 df_5m.loc[df_5m.index[i], 'strike'] = strike
@@ -233,26 +365,68 @@ class MultiTimeframeStrategy(StrategyTemplate):
             
         # Get latest params (in case they were changed in UI)
         params = self.parameters 
+        
+        # Note: historical_data already has 5m, 15m, 1h merged from AngelClient.get_multi_timeframe_data()
+        # We just need to calculate the base 5m indicators (EMA, ATR, RSI, ADX) on top of it.
+        # The higher timeframe columns (ema_short_15m, ema_long_15m, etc.) are ALREADY present.
+        
         df_5m = self.calculate_indicators(historical_data, **params)
         
         if df_5m is None or df_5m.empty or len(df_5m) < 2: return None
             
-        current = df_5m.iloc[-1]; prev = df_5m.iloc[-2]
+        # --- NEW: Ensure we use the LAST COMPLETED candle ---
+        # If the last candle in the dataframe is still forming (based on time), we use the one before it.
+        last_candle_time = df_5m.index[-1]
+        now = datetime.now(self.IST)
         
+        # Assuming 5m candles. If current time is before candle_start + 5m, it's forming.
+        # We add a small buffer (e.g. 1 sec) to be safe.
+        is_forming = (last_candle_time + timedelta(minutes=5)) > now
+        
+        if is_forming:
+            # Last candle is forming, so use the previous one (which is completed)
+            if len(df_5m) < 3: return None # Need at least 2 completed candles
+            current = df_5m.iloc[-2]
+            prev = df_5m.iloc[-3]
+            # print(f"[{now.strftime('%H:%M:%S')}] Last candle ({last_candle_time.strftime('%H:%M')}) is forming. Using {current.name.strftime('%H:%M')}.")
+        else:
+            # Last candle is completed
+            current = df_5m.iloc[-1]
+            prev = df_5m.iloc[-2]
+            # print(f"[{now.strftime('%H:%M:%S')}] Last candle ({last_candle_time.strftime('%H:%M')}) is completed. Using it.")
+        
+        # Check if required columns exist (they should be there from get_multi_timeframe_data)
         if pd.isna(current['ema_short']) or pd.isna(current['ema_short_15m']) or pd.isna(current['ema_short_1h']) or pd.isna(prev['ema_short']):
+            # print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping signal: Missing EMA data (5m/15m/1h)")
             return None
         
         # --- NEW: Get filter params ---
-        use_adx_filter = params.get('use_adx_filter', True)
+        use_adx_filter = params.get('use_adx_filter', False)
         adx_threshold = params.get('adx_threshold', 20)
         use_rsi_filter = params.get('use_rsi_filter', True)
         rsi_overbought = params.get('rsi_overbought', 70)
         rsi_oversold = params.get('rsi_oversold', 30)
         
+        # --- NEW: Expiry Filter ---
+        skip_last_week_expiry = params.get('skip_last_week_expiry', True)
+        if skip_last_week_expiry:
+            if self._is_last_week_of_expiry(datetime.now(self.IST)):
+                # print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping signal: Last week of expiry")
+                return None
+
+        # --- NEW: Candle Size Filter ---
+        use_candle_size_filter = params.get('use_candle_size_filter', True)
+        candle_size_factor = params.get('candle_size_factor', 1.0)
+        
+        if use_candle_size_filter:
+            if pd.isna(current['avg_candle_range']) or current['candle_range'] < (current['avg_candle_range'] * candle_size_factor):
+                # print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping signal: Candle too small")
+                return None
+        
         # --- NEW: ADX Filter ---
         if use_adx_filter:
             if pd.isna(current['adx']) or current['adx'] < adx_threshold:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping signal check: ADX ({current['adx']:.1f}) is below threshold ({adx_threshold})")
+                # print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping signal check: ADX ({current['adx']:.1f}) is below threshold ({adx_threshold})")
                 return None
             
         if self.daily_trend == 'NEUTRAL':
@@ -265,13 +439,16 @@ class MultiTimeframeStrategy(StrategyTemplate):
         is_1h_downtrend = current['ema_short_1h'] < current['ema_long_1h']
         is_15m_uptrend = current['ema_short_15m'] > current['ema_long_15m']
         is_15m_downtrend = current['ema_short_15m'] < current['ema_long_15m']
+        is_5m_uptrend = current['ema_short'] > current['ema_long'] # Base trend (5m)
+        is_5m_downtrend = current['ema_short'] < current['ema_long'] # Base trend (5m)
         
+        # Signal is a 5m Crossover (previously named 1m, but data is 5m)
         is_5m_bullish_cross = (prev['ema_short'] <= prev['ema_long']) and (current['ema_short'] > current['ema_long'])
         is_5m_bearish_cross = (prev['ema_short'] >= prev['ema_long']) and (current['ema_short'] < current['ema_long'])
         
         signal_to_fire = None
         
-        if is_5m_bullish_cross and is_15m_uptrend and is_1h_uptrend:
+        if is_5m_bullish_cross and is_5m_uptrend and is_15m_uptrend and is_1h_uptrend:
             # --- NEW: RSI Overbought Filter ---
             if use_rsi_filter and not pd.isna(current['rsi']) and current['rsi'] > rsi_overbought:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping BUY signal: RSI ({current['rsi']:.1f}) is Overbought (>{rsi_overbought})")
@@ -279,10 +456,11 @@ class MultiTimeframeStrategy(StrategyTemplate):
                 
             signal_to_fire = {"signal": "BUY", "type": "CE", "price": current['close'], 
                               "strike": int(round(current['close'] / 100.0) * 100), 
-                              "reason": "MTA: 5m Crossover UP (15m/1h UP)", 
-                              "atr": current['atr']}
+                              "reason": "MTA: 5m Crossover UP (5m/15m/1h UP)", 
+                              "atr": current['atr'], "adx": current['adx'],
+                              "timestamp": current.name}
                               
-        elif is_5m_bearish_cross and is_15m_downtrend and is_1h_downtrend:
+        elif is_5m_bearish_cross and is_5m_downtrend and is_15m_downtrend and is_1h_downtrend:
             # --- NEW: RSI Oversold Filter ---
             if use_rsi_filter and not pd.isna(current['rsi']) and current['rsi'] < rsi_oversold:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping SELL signal: RSI ({current['rsi']:.1f}) is Oversold (<{rsi_oversold})")
@@ -290,8 +468,9 @@ class MultiTimeframeStrategy(StrategyTemplate):
 
             signal_to_fire = {"signal": "BUY", "type": "PE", "price": current['close'], 
                               "strike": int(round(current['close'] / 100.0) * 100), 
-                              "reason": "MTA: 5m Crossover DOWN (15m/1h DOWN)", 
-                              "atr": current['atr']}
+                              "reason": "MTA: 5m Crossover DOWN (5m/15m/1h DOWN)", 
+                              "atr": current['atr'], "adx": current['adx'],
+                              "timestamp": current.name}
         
         return signal_to_fire
 
@@ -317,6 +496,80 @@ class EMAStrategy(StrategyTemplate):
     def generate_signals(self, data: pd.DataFrame, **kwargs) -> pd.DataFrame: data['signal'] = 0; return data
     def generate_live_signal(self, historical_data: pd.DataFrame) -> Optional[Dict[str, Any]]: return None
 
+# --- NEW: AI Prediction Strategy ---
+class AIStrategy(StrategyTemplate):
+    def __init__(self):
+        super().__init__(
+            name="AI Prediction Strategy", 
+            description="Trades based on Neural Network predictions (5m/15m/1h features)."
+        )
+        self.parameters = {
+            'lookback': 10,
+            'lot_size': 35, 'min_investment': 10000,
+            'max_daily_loss': 2000, 'max_trades_per_day': 10,
+            'trade_start_time': time(9, 30), 'trade_end_time': time(15, 0),
+            'sl_mode': 'ATR', 'invested_value_sl_pct': 5.0, 'tp_sl_ratio': 2.0,
+            'atr_tp_multiplier': 2.0, 'atr_sl_multiplier': 1.0,
+            'simulated_premium_pct': 0.008, 'simulated_delta': 0.5,
+        }
+        self.predictor = None
+
+    def set_predictor(self, predictor):
+        self.predictor = predictor
+
+    def generate_signals(self, data: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        if self.predictor is None:
+            print("AIStrategy: No predictor set. Returning empty signals.")
+            return pd.DataFrame()
+
+        df = data.copy()
+        
+        # Run prediction
+        # Note: predictor.predict expects the dataframe to have the raw columns.
+        # It will handle feature generation.
+        try:
+            results, _ = self.predictor.predict(df, lookback=kwargs.get('lookback', 10))
+        except Exception as e:
+            print(f"AIStrategy Prediction Error: {e}")
+            return pd.DataFrame()
+        
+        # Join predictions back to original dataframe
+        # 'results' index is a subset of 'df' index (due to lags)
+        df = df.join(results[['Predicted']], how='left')
+        
+        df['signal'] = 0
+        df['strike'] = 0
+        df['opt_type'] = ""
+        
+        # Calculate ATR for SL/TP
+        if 'atr' not in df.columns:
+             df.ta.atr(length=14, append=True)
+             if 'ATRr_14' in df.columns: df.rename(columns={'ATRr_14': 'atr'}, inplace=True)
+
+        # Generate Signals
+        # BUY if Predicted > Close (Expect UP)
+        # SELL if Predicted < Close (Expect DOWN)
+        
+        # We use a small threshold to avoid noise? 
+        # For now, raw direction.
+        
+        buy_condition = (df['Predicted'] > df['close'])
+        sell_condition = (df['Predicted'] < df['close'])
+        
+        df.loc[buy_condition, 'signal'] = 1
+        df.loc[buy_condition, 'opt_type'] = "CE"
+        
+        df.loc[sell_condition, 'signal'] = -1
+        df.loc[sell_condition, 'opt_type'] = "PE"
+        
+        df['strike'] = (df['close'] / 100).round() * 100
+        
+        return df
+
+    def generate_live_signal(self, historical_data: pd.DataFrame) -> Optional[Dict[str, Any]]:
+        # Not implemented for live yet, as it requires the trained model state
+        return None
+
 
 class BacktestEngine:
     # ... (init, register_builtin_strategies, register_strategy are unchanged) ...
@@ -335,7 +588,9 @@ class BacktestEngine:
         self.strategies['ema_scalp_sim'] = EmaFastCrossoverStrategy()
         self.strategies['ema_trend_confirm'] = EmaTrendConfirmationStrategy()
         self.strategies['ema_momentum'] = EmaMomentumStrategy()
+        self.strategies['ema_momentum'] = EmaMomentumStrategy()
         self.strategies['ema_confluence_strict'] = EMAStrategy()
+        self.strategies['ai_prediction'] = AIStrategy()
 
     def register_strategy(self, name: str, strategy: StrategyTemplate): 
         self.strategies[name] = strategy
@@ -352,18 +607,17 @@ class BacktestEngine:
             
         self.initial_capital = strategy_params.get('initial_capital', 100000)
         
-        if data is None:
-            if not self.data_manager.is_authenticated():
-                if not silent: st.error("Fyers API is not authenticated.")
-                return BacktestResult(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,[],pd.DataFrame(),[],{},"",{})
-            
-            data = self.data_manager.get_historical_index_data(symbol, start_date, end_date, interval, is_backtest_log=not silent)
-            
-            if data is None or data.empty:
-                 if not silent: st.error("Failed to load Fyers index data.")
-                 return BacktestResult(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,[],pd.DataFrame(),[],{},"",{})
-        
         strategy = self.strategies[strategy_name]
+        
+        # --- NEW: Use strategy's prepare_data method ---
+        if data is None:
+            if not silent: st.info(f"Fetching data for {symbol}...")
+            data = strategy.prepare_data(self, symbol, start_date, end_date, interval, **strategy_params)
+            
+        if data is None or data.empty:
+            if not silent: st.error("No data found.")
+            return BacktestResult(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,[],pd.DataFrame(),[],{},"",{})
+        
         original_params = strategy.parameters.copy()
         merged_params = {**strategy.parameters, **strategy_params, "backtest_mode": backtest_mode}
         strategy.parameters = merged_params 
@@ -517,8 +771,23 @@ class BacktestEngine:
                         temp_sl_mode = "Invested Value (%)"
                     else:
                         temp_sl_mode = "ATR"
-                        option_sl_points = (current_atr * params.get('atr_sl_multiplier', 1.0)) * sim_delta
-                        option_tp_points = (current_atr * params.get('atr_tp_multiplier', 2.0)) * sim_delta
+                        
+                        # --- NEW: Dynamic Risk Management ---
+                        use_dynamic_risk = params.get('use_dynamic_risk', False)
+                        tp_mult = params.get('atr_tp_multiplier', 2.0)
+                        sl_mult = params.get('atr_sl_multiplier', 1.0)
+                        
+                        if use_dynamic_risk and 'adx' in row and not pd.isna(row['adx']):
+                            adx_val = row['adx']
+                            # If ADX > 25, increase TP multiplier (Trend Following)
+                            # If ADX < 20, decrease TP multiplier (Choppy)
+                            if adx_val > 25:
+                                tp_mult *= (1 + (adx_val - 25) / 100.0) # e.g. ADX 45 -> +20% TP
+                            elif adx_val < 20:
+                                tp_mult *= 0.8 # Reduce TP in low ADX
+                        
+                        option_sl_points = (current_atr * sl_mult) * sim_delta
+                        option_tp_points = (current_atr * tp_mult) * sim_delta
                 else:
                     temp_sl_mode = "Invested Value (%)"
 
@@ -683,6 +952,8 @@ class BacktestEngine:
                     current_option_df = daily_option_data_cache[cache_key]
                     
                     option_candle = current_option_df.loc[timestamp]
+                    if isinstance(option_candle, pd.DataFrame):
+                        option_candle = option_candle.iloc[0]
                     entry_price = option_candle['close']
                     
                 except KeyError:
@@ -699,7 +970,7 @@ class BacktestEngine:
                     if not silent: st.warning(f"Option price {entry_price} too low. Skipping day.")
                     skip_today = True; continue 
                 
-                position = quantity if opt_type == "CE" else -quantity 
+                position = quantity # Always Long (Buy CE or Buy PE) 
                 entry_index = i
                 
                 stop_loss_price, take_profit_price = 0.0, 0.0
@@ -710,8 +981,21 @@ class BacktestEngine:
                         temp_sl_mode = "Invested Value (%)"
                     else:
                         temp_sl_mode = "ATR"
-                        option_sl_points = (current_atr * params.get('atr_sl_multiplier', 1.0)) * 0.5
-                        option_tp_points = (current_atr * params.get('atr_tp_multiplier', 2.0)) * 0.5
+                        
+                        # --- NEW: Dynamic Risk Management ---
+                        use_dynamic_risk = params.get('use_dynamic_risk', False)
+                        tp_mult = params.get('atr_tp_multiplier', 2.0)
+                        sl_mult = params.get('atr_sl_multiplier', 1.0)
+                        
+                        if use_dynamic_risk and 'adx' in row and not pd.isna(row['adx']):
+                            adx_val = row['adx']
+                            if adx_val > 25:
+                                tp_mult *= (1 + (adx_val - 25) / 100.0)
+                            elif adx_val < 20:
+                                tp_mult *= 0.8
+                                
+                        option_sl_points = (current_atr * sl_mult) * 0.5
+                        option_tp_points = (current_atr * tp_mult) * 0.5
                 else:
                     temp_sl_mode = "Invested Value (%)"
 
@@ -836,3 +1120,6 @@ class StrategyTester:
         if strategy_name in self.engine.strategies: 
             return self.engine.strategies[strategy_name].parameters
         return {}
+
+    def run_backtest(self, strategy_name: str, symbol: str, start_date: datetime, end_date: datetime, interval: str = "5", silent: bool = False, **kwargs) -> BacktestResult:
+        return self.engine.run_backtest(strategy_name, symbol, start_date, end_date, interval, silent, **kwargs)

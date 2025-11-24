@@ -6,6 +6,8 @@ import os
 import sys
 import json
 import random
+import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta, time as dt_time
 from multiprocessing import Pool, cpu_count
 from dotenv import load_dotenv
@@ -40,6 +42,7 @@ TARGET_MAX_DRAWDOWN = 10.0
 
 # --- Parameter Space ---
 PARAM_SPACE = {
+    'interval': ['1m', '5m'], # Optimize over interval
     'ema_short': (2, 15),
     'ema_long': (16, 50),
     'atr_period': (10, 30),
@@ -48,6 +51,12 @@ PARAM_SPACE = {
     'max_trades_per_day': (1, 10),
     'trade_start_time': (dt_time(9, 16), dt_time(12, 0)),
     'trade_end_time': (dt_time(12, 0), dt_time(15, 15)),
+    # --- NEW: ADX/RSI Params ---
+    'rsi_period': (10, 30),
+    'rsi_overbought': (65, 80),
+    'rsi_oversold': (20, 35),
+    'adx_period': (10, 20),
+    'adx_threshold': (18, 30)
 }
 
 def random_time(start, end):
@@ -59,6 +68,7 @@ def random_time(start, end):
 def generate_random_params():
     """Generates one set of random parameters."""
     rand_params = {
+        'interval': random.choice(PARAM_SPACE['interval']),
         'ema_short': random.randint(PARAM_SPACE['ema_short'][0], PARAM_SPACE['ema_short'][1]),
         'ema_long': random.randint(PARAM_SPACE['ema_long'][0], PARAM_SPACE['ema_long'][1]),
         'atr_period': random.randint(PARAM_SPACE['atr_period'][0], PARAM_SPACE['atr_period'][1]),
@@ -69,10 +79,30 @@ def generate_random_params():
         'trade_end_time': random_time(PARAM_SPACE['trade_end_time'][0], PARAM_SPACE['trade_end_time'][1]),
         'sl_mode': 'ATR', 
         'initial_capital': 20000,
+        # --- NEW: Randomize ADX/RSI params ---
+        'use_rsi_filter': True,
+        'rsi_period': random.randint(PARAM_SPACE['rsi_period'][0], PARAM_SPACE['rsi_period'][1]),
+        'rsi_overbought': random.randint(PARAM_SPACE['rsi_overbought'][0], PARAM_SPACE['rsi_overbought'][1]),
+        'rsi_oversold': random.randint(PARAM_SPACE['rsi_oversold'][0], PARAM_SPACE['rsi_oversold'][1]),
+        'use_adx_filter': True,
+        'adx_period': random.randint(PARAM_SPACE['adx_period'][0], PARAM_SPACE['adx_period'][1]),
+        'adx_threshold': random.randint(PARAM_SPACE['adx_threshold'][0], PARAM_SPACE['adx_threshold'][1]),
+        'use_dynamic_risk': True, # Enable dynamic risk by default in optimizer
     }
     if rand_params['ema_short'] >= rand_params['ema_long']:
         rand_params['ema_long'] = rand_params['ema_short'] + 1
     return rand_params
+
+# --- Multiprocessing Init ---
+# Global variables for workers
+worker_data_1m = None
+worker_data_5m = None
+
+def init_worker(data_1m, data_5m):
+    """Initializer to share data memory with workers."""
+    global worker_data_1m, worker_data_5m
+    worker_data_1m = data_1m
+    worker_data_5m = data_5m
 
 def run_backtest_wrapper(params_tuple):
     """
@@ -80,26 +110,33 @@ def run_backtest_wrapper(params_tuple):
     It re-initializes the non-picklable Fyers manager
     inside the child process.
     """
-    iteration, total_iterations, params, data = params_tuple
+    iteration, total_iterations, params = params_tuple
     
     try:
         # --- Re-initialize components for this process ---
-        # We can't pass the main 'tester' object to a new process
         fyers_manager = FyersDataManager()
         tester = StrategyTester(fyers_manager=fyers_manager)
+        
+        # Select data based on interval param
+        if params['interval'] == '5m':
+            data_to_use = worker_data_5m.copy()
+            interval_arg = "5"
+        else:
+            data_to_use = worker_data_1m.copy()
+            interval_arg = "1"
         
         result = tester.engine.run_backtest(
             strategy_name=STRATEGY_KEY,
             symbol=INDEX_TO_TEST,
             start_date=START_DATE,
             end_date=END_DATE,
-            interval="5",
+            interval=interval_arg,
             silent=True, 
-            data=data.copy(), # Pass the pre-fetched data
+            data=data_to_use, # Pass the shared data
             **params
         )
         
-        print(f"  > Iteration {iteration}/{total_iterations}: Sharpe {result.sharpe_ratio:.2f}, WR {result.win_rate:.1f}%, Trades {result.total_trades}")
+        print(f"  > Iteration {iteration}/{total_iterations} [{params['interval']}]: Sharpe {result.sharpe_ratio:.2f}, WR {result.win_rate:.1f}%, Trades {result.total_trades}")
 
         is_good = (
             result.sharpe_ratio >= TARGET_SHARPE and
@@ -116,6 +153,7 @@ def run_backtest_wrapper(params_tuple):
                 "P&L (₹)": result.total_pnl,
                 "Max DD (%)": result.max_drawdown,
                 "Trades": result.total_trades,
+                "Interval": params['interval'],
                 "ema_short": params['ema_short'],
                 "ema_long": params['ema_long'],
                 "atr_period": params['atr_period'],
@@ -145,12 +183,21 @@ def main():
         print(f"❌ Failed to initialize Fyers Manager: {e}")
         return
 
-    print(f"Fetching {INDEX_TO_TEST} data from {START_DATE.date()} to {END_DATE.date()}...")
+    print(f"Fetching {INDEX_TO_TEST} 1m data from {START_DATE.date()} to {END_DATE.date()}...")
     try:
-        data = fyers_manager.get_historical_data(INDEX_TO_TEST, START_DATE, END_DATE, "5", is_backtest_log=True)
-        if data is None or data.empty:
+        # Always fetch 1m data
+        data_1m = fyers_manager.get_historical_index_data(INDEX_TO_TEST, START_DATE, END_DATE, "1", is_backtest_log=True)
+        if data_1m is None or data_1m.empty:
             raise Exception("No data returned.")
-        print(f"✅ Data fetched successfully ({len(data)} candles).")
+        print(f"✅ 1m Data fetched successfully ({len(data_1m)} candles).")
+        
+        # Pre-calculate 5m data for optimization
+        print("Pre-calculating 5m data...")
+        data_5m = data_1m.resample('5min').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+        }).dropna()
+        print(f"✅ 5m Data generated ({len(data_5m)} candles).")
+        
     except Exception as e:
         print(f"❌ Failed to fetch data: {e}")
         return
@@ -159,14 +206,15 @@ def main():
     print(f"Generating {NUM_ITERATIONS} random parameter sets...")
     param_list = [generate_random_params() for _ in range(NUM_ITERATIONS)]
     
-    # 3. Create a list of tasks for the pool
-    tasks = [(i+1, NUM_ITERATIONS, param_list[i], data) for i in range(NUM_ITERATIONS)]
+    # 3. Create a list of tasks for the pool (params only, data is shared)
+    tasks = [(i+1, NUM_ITERATIONS, param_list[i]) for i in range(NUM_ITERATIONS)]
 
     # 4. Run tasks in parallel
     num_cores = cpu_count()
     print(f"--- Starting {NUM_ITERATIONS} iterations in parallel on {num_cores} cores ---")
     
-    with Pool(processes=num_cores) as pool:
+    # Use initializer to share data without pickling it for every task
+    with Pool(processes=num_cores, initializer=init_worker, initargs=(data_1m, data_5m)) as pool:
         results = pool.map(run_backtest_wrapper, tasks)
     
     # 5. Filter out the None results

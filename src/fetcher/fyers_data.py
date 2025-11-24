@@ -39,6 +39,11 @@ class FyersDataManager:
         self.app_session = None
         self.fyers = None
         
+        # Cache for authentication status to avoid repeated API calls
+        self._auth_cache = None
+        self._auth_cache_time = 0
+        self._auth_cache_ttl = 60  # Cache for 60 seconds
+        
         self.access_token = self._load_token()
         if self.access_token:
             self._initialize_fyers_model()
@@ -134,27 +139,78 @@ class FyersDataManager:
             print(f"Exception during token generation: {e}")
             return False
 
-    def is_authenticated(self) -> bool:
+    def is_authenticated(self, use_cache: bool = True) -> bool:
         """
         Checks if the fyers model is initialized AND validates the token 
         by making a lightweight API call (get_profile).
+        
+        Args:
+            use_cache: If True, uses cached result if available and not expired.
+                      If False, always makes a fresh API call.
         """
         if self.fyers is None:
             return False
         
+        # Check cache first if enabled
+        if use_cache:
+            current_time = time.time()
+            if self._auth_cache is not None and (current_time - self._auth_cache_time) < self._auth_cache_ttl:
+                return self._auth_cache
+        
+        # Make API call to validate
         try:
             response = self.fyers.get_profile()
             if response.get("s") == "ok" or response.get("code") == 200:
+                self._auth_cache = True
+                self._auth_cache_time = time.time()
                 return True
             else:
                 print(f"Token validation failed. API Response: {response}")
+                self._auth_cache = False
+                self._auth_cache_time = time.time()
                 return False
         except Exception as e:
             print(f"Token validation exception (Network/API error): {e}")
+            self._auth_cache = False
+            self._auth_cache_time = time.time()
+            return False
+
+    def reload_token(self) -> bool:
+        """
+        Reloads the access token from the token file and reinitializes the Fyers model.
+        This allows updating the token without restarting the application.
+        Returns True if token was successfully reloaded and validated, False otherwise.
+        """
+        print("🔄 Reloading token from file...")
+        new_token = self._load_token()
+        
+        if not new_token:
+            print("❌ No token found in file.")
+            self.access_token = None
+            self.fyers = None
+            self._auth_cache = None  # Invalidate cache
+            return False
+        
+        # Update the token
+        self.access_token = new_token
+        
+        # Invalidate auth cache since we're loading a new token
+        self._auth_cache = None
+        self._auth_cache_time = 0
+        
+        # Reinitialize the Fyers model with the new token
+        self._initialize_fyers_model()
+        
+        # Validate the new token (bypass cache for fresh validation)
+        if self.is_authenticated(use_cache=False):
+            print("✅ Token reloaded and validated successfully!")
+            return True
+        else:
+            print("❌ Token reload failed - token is invalid or expired.")
             return False
 
     def get_historical_index_data(self, index_name: str, start_date: datetime, end_date: datetime, 
-                                  interval: str = "5", is_backtest_log: bool = False) -> pd.DataFrame:
+                                  interval: str = "1", is_backtest_log: bool = False) -> pd.DataFrame:
         """Fetches historical data for an INDEX."""
         if not self.is_authenticated():
             raise Exception("Fyers client is not authenticated.")
@@ -244,7 +300,7 @@ class FyersDataManager:
         return f"NSE:{underlying}{yy}{m}{dd}{strike}{opt_type}"
 
     def get_historical_option_data(self, index_name: str, trade_date: datetime, 
-                                   strike: int, opt_type: str, interval: str = "5") -> pd.DataFrame:
+                                   strike: int, opt_type: str, interval: str = "1") -> pd.DataFrame:
         """
         Fetches historical data for a specific OPTION contract for a SINGLE DAY.
         Handles the transition from Weekly to Monthly contracts after Nov 13, 2024.

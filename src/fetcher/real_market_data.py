@@ -39,11 +39,17 @@ class RealMarketData:
         
     def _setup_session(self):
         # ... (no change) ...
-        try:
-            self.session.get("https://www.nseindia.com/option-chain", timeout=10)
-            print("✅ NSE session initialized.")
-        except Exception as e:
-            print(f"❌ Failed to initialize NSE session: {e}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.session.get("https://www.nseindia.com/option-chain", timeout=30)
+                print("✅ NSE session initialized.")
+                return
+            except Exception as e:
+                print(f"⚠️ NSE session init attempt {attempt + 1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+        print("❌ Failed to initialize NSE session after multiple attempts.")
 
     def get_index_spot(self, index_name: str) -> float:
         # ... (no change) ...
@@ -101,13 +107,68 @@ class RealMarketData:
             response.raise_for_status()
             return response.json()
 
+    def _analyze_expiry_type(self, expiry_dates: List[str]) -> Dict[str, Any]:
+        """
+        Analyzes expiry dates to determine if they are weekly or monthly.
+        Returns metadata about expiry pattern.
+        """
+        if len(expiry_dates) < 2:
+            return {"type": "unknown", "dates": expiry_dates, "avg_gap_days": 0}
+        
+        # Parse dates and calculate gaps (check first 3 expiries)
+        dates = [datetime.strptime(d, "%d-%b-%Y") for d in expiry_dates[:min(3, len(expiry_dates))]]
+        gaps = [(dates[i+1] - dates[i]).days for i in range(len(dates)-1)]
+        avg_gap = sum(gaps) / len(gaps)
+        
+        # Determine type based on average gap
+        if avg_gap <= 10:  # Weekly expiries (~7 days)
+            return {"type": "weekly", "dates": expiry_dates, "avg_gap_days": avg_gap}
+        else:  # Monthly expiries (~28-35 days)
+            return {"type": "monthly", "dates": expiry_dates, "avg_gap_days": avg_gap}
+    
+    def _filter_weekly_expiries(self, expiry_dates: List[str]) -> List[str]:
+        """
+        Filters weekly expiries from a list that may contain both weekly and monthly.
+        Weekly expiries are typically ~7 days apart.
+        """
+        if len(expiry_dates) < 2:
+            return expiry_dates
+        
+        weekly = [expiry_dates[0]]  # Always include first
+        
+        for i in range(1, len(expiry_dates)):
+            prev_date = datetime.strptime(weekly[-1], "%d-%b-%Y")
+            curr_date = datetime.strptime(expiry_dates[i], "%d-%b-%Y")
+            gap = (curr_date - prev_date).days
+            
+            # If gap is ~7 days, it's weekly
+            if 5 <= gap <= 10:
+                weekly.append(expiry_dates[i])
+        
+        return weekly if len(weekly) > 1 else expiry_dates
+    
     def get_expiry_dates(self, symbol: str) -> List[str]:
-        # ... (no change) ...
+        """Get expiry dates with automatic weekly filtering for NIFTY"""
         try:
             data = self._fetch_nse_option_data(symbol)
             expirations = data.get('records', {}).get('expiryDates', [])
             if not expirations:
                 raise Exception("No expiry dates found in NSE API response.")
+            
+            # Analyze expiry pattern
+            expiry_info = self._analyze_expiry_type(expirations)
+            
+            # For NIFTY, prefer weekly expiries if available
+            if symbol == "NIFTY":
+                if expiry_info["type"] == "monthly" or expiry_info["avg_gap_days"] > 10:
+                    # Try to filter weekly expiries from the list
+                    weekly_expiries = self._filter_weekly_expiries(expirations)
+                    if len(weekly_expiries) > 1:
+                        print(f"✅ NIFTY: Filtered {len(weekly_expiries)} weekly expiries from {len(expirations)} total expiries")
+                        return weekly_expiries
+                else:
+                    print(f"✅ NIFTY: Using weekly expiries (avg gap: {expiry_info['avg_gap_days']:.1f} days)")
+            
             return expirations
         except Exception as e:
             print(f"Warning: Failed to fetch expiries from NSE ({e}). Generating fallback dates.")
