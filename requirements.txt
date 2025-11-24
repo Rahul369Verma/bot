@@ -7,5 +7,6 @@ smartapi-python
 pyotp
 streamlit-autorefresh
 pandas-ta
-fyers-api3
+fyers-apiv3
 requests
+kiteconnect
