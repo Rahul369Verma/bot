@@ -10,3 +10,4 @@ pandas-ta
 fyers-apiv3
 requests
 kiteconnect
+yfinance
