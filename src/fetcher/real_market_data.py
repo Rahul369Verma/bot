@@ -96,11 +96,26 @@ class RealMarketData:
     def _fetch_nse_option_data(self, symbol: str) -> Dict[str, Any]:
         # ... (no change) ...
         # Map "NIFTY 50" to "NIFTY" for NSE API
-        if symbol == "NIFTY 50": symbol = "NIFTY"
-        if symbol == "BANKNIFTY": symbol = "BANKNIFTY"
+        is_index = False
+        if symbol == "NIFTY 50": 
+            symbol = "NIFTY"
+            is_index = True
+        elif symbol == "BANKNIFTY": 
+            symbol = "BANKNIFTY"
+            is_index = True
+        elif symbol == "NIFTY": # Handle if passed directly
+            is_index = True
         
-        api_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+        # Construct URL based on type (Index vs Equity)
+        if is_index:
+            api_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+        else:
+            # For stocks, use the equities endpoint
+            # Symbol needs to be URL encoded if it contains special chars, but NSE symbols usually don't
+            api_url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
+            
         try:
+            print(f"Fetching NSE Option Chain for {symbol} (Index={is_index})...")
             response = self.session.get(api_url, timeout=10)
             response.raise_for_status()
             return response.json()
@@ -218,10 +233,11 @@ class RealMarketData:
         except Exception as e:
             raise Exception(f"Failed to parse NSE option chain: {e}")
 
-    def get_candle_data(self) -> Dict[str, Any]:
+    def get_candle_data(self, symbol: str = "^NSEBANK") -> Dict[str, Any]:
         # ... (no change) ...
         try:
-            ticker = yf.Ticker("^NSEBANK"); data_5min = ticker.history(period="2d", interval="5m"); data_15min = ticker.history(period="2d", interval="15m")
+            # Use the provided symbol (YFinance format)
+            ticker = yf.Ticker(symbol); data_5min = ticker.history(period="2d", interval="5m"); data_15min = ticker.history(period="2d", interval="15m")
             if data_5min.empty or data_15min.empty: raise Exception("No candle data available from Yahoo Finance")
             five_min_candles = []
             for idx, row in data_5min.tail(24).iterrows():

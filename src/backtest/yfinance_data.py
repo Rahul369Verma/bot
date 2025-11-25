@@ -7,6 +7,7 @@
 import yfinance as yf
 import pandas as pd
 from typing import Dict
+from utils.constants import ALL_STOCKS
 
 class YFinanceData:
     """
@@ -19,6 +20,10 @@ class YFinanceData:
         "BANKNIFTY": "^NSEBANK",
         "NIFTY 50": "^NSEI"
     }
+    
+    # Add stocks to the map
+    for stock in ALL_STOCKS:
+        INDEX_TICKERS[stock] = f"{stock}.NS"
 
     def __init__(self):
         self.symbol_mapping = self.INDEX_TICKERS

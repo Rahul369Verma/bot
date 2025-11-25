@@ -1,13 +1,18 @@
 import streamlit as st
 
+from utils.constants import ALL_STOCKS
+
 def render_sidebar():
     """Renders the sidebar and returns the selected index and trading mode."""
     st.sidebar.title("⚙️ Bot Controls")
     
     # Index Selection
+    # Combine Indices and Stocks
+    available_instruments = ["BANKNIFTY", "NIFTY 50"] + ALL_STOCKS
+    
     selected_index = st.sidebar.selectbox(
-        "SELECT INDEX", 
-        ["BANKNIFTY", "NIFTY 50"],
+        "SELECT INSTRUMENT", 
+        available_instruments,
         key="selected_index"
     )
     

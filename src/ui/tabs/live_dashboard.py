@@ -46,7 +46,21 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
             min_value=1, step=1,
             key="live_max_trades"
         )
-        start_time_input = st_col3.time_input(
+        
+        # --- NEW: Lot Size Input ---
+        # Default to current angel.lot_size (which is set from constants)
+        lot_size_input = st_col3.number_input(
+            "Lot Size",
+            value=angel.lot_size,
+            min_value=1, step=1,
+            help="Number of units per lot (e.g., 35 for BankNifty, 75 for Nifty50, 1 for Stocks)",
+            key="live_lot_size"
+        )
+        # Update Angel Client immediately
+        if angel.lot_size != lot_size_input:
+            angel.lot_size = lot_size_input
+            
+        start_time_input = st_col4.time_input(
             "Trade Start Time",
             value=default_params.get('trade_start_time', dt_time(9, 30)),
             key="live_start_time"
@@ -290,21 +304,19 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
             display_expiries = all_expiry_dates
             
             # Determine expiry type label for display
-            if selected_index == "BANKNIFTY":
-                expiry_type_label = "Weekly"
-            else:  # NIFTY 50
-                # Check if we have weekly expiries (gap ~7 days)
-                if len(display_expiries) >= 2:
-                    from datetime import datetime
-                    try:
-                        date1 = datetime.strptime(display_expiries[0], "%d-%b-%Y")
-                        date2 = datetime.strptime(display_expiries[1], "%d-%b-%Y")
-                        gap = (date2 - date1).days
-                        expiry_type_label = "Weekly (Auto)" if gap <= 10 else "Monthly"
-                    except:
-                        expiry_type_label = "Auto"
-                else:
+            # Determine expiry type label for display
+            # Check if we have weekly expiries (gap ~7 days)
+            if len(display_expiries) >= 2:
+                from datetime import datetime
+                try:
+                    date1 = datetime.strptime(display_expiries[0], "%d-%b-%Y")
+                    date2 = datetime.strptime(display_expiries[1], "%d-%b-%Y")
+                    gap = (date2 - date1).days
+                    expiry_type_label = "Weekly" if gap <= 10 else "Monthly"
+                except:
                     expiry_type_label = "Auto"
+            else:
+                expiry_type_label = "Auto"
             
             col1, col2 = st.columns([1, 3])
             with col1:

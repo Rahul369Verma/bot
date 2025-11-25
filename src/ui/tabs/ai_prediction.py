@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 
+from utils.constants import ALL_STOCKS
+
 def render_ai_prediction_tab(tester):
     """Renders the AI Prediction tab."""
     st.header("🧠 AI Price Prediction (Neural Network)")
@@ -9,7 +11,9 @@ def render_ai_prediction_tab(tester):
     
     ai_col1, ai_col2 = st.columns(2)
     with ai_col1:
-        ai_symbol = st.selectbox("Select Symbol", ["BANKNIFTY", "NIFTY 50"], index=0, key="ai_symbol")
+        # Combine Indices and Stocks
+        available_instruments = ["BANKNIFTY", "NIFTY 50"] + ALL_STOCKS
+        ai_symbol = st.selectbox("Select Symbol", available_instruments, index=0, key="ai_symbol")
         ai_lookback = st.slider("Lookback Period (Candles)", 5, 50, 10, help="Number of past candles to use as features.")
     with ai_col2:
         ai_start_date = st.date_input("Training Start Date", datetime.now() - timedelta(days=365), key="ai_start")

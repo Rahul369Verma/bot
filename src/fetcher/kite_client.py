@@ -1,6 +1,6 @@
-# fetcher/kite_client.py
 from kiteconnect import KiteConnect
 import logging
+from typing import Dict, Any, List
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -201,3 +201,44 @@ class KiteClient:
         except Exception as e:
             logger.error(f"Error fetching option chain: {e}")
             return []
+    def get_quote(self, tradingsymbol: str, exchange: str = "NFO") -> Dict[str, Any]:
+        """
+        Fetches the latest quote for a single instrument.
+        """
+        if self.paper:
+            # Mock quote for paper mode (if not connected to real Kite)
+            return {"last_price": 100.0, "ohlc": {"open": 90, "high": 110, "low": 80, "close": 95}}
+        
+        try:
+            quote = self.kite.quote(f"{exchange}:{tradingsymbol}")
+            return quote.get(f"{exchange}:{tradingsymbol}", {})
+        except Exception as e:
+            logger.error(f"Error fetching quote for {tradingsymbol}: {e}")
+            return {}
+
+    def get_historical_data(self, instrument_token: int, from_date: str, to_date: str, interval: str) -> List[Dict[str, Any]]:
+        """
+        Fetches historical candle data.
+        """
+        if self.paper:
+            return []
+        
+        try:
+            return self.kite.historical_data(instrument_token, from_date, to_date, interval)
+        except Exception as e:
+            logger.error(f"Error fetching historical data: {e}")
+            return []
+
+    def get_instrument_token(self, tradingsymbol: str, exchange: str = "NFO") -> int:
+        """
+        Helper to find instrument token for a symbol.
+        """
+        try:
+            instruments = self.kite.instruments(exchange)
+            for inst in instruments:
+                if inst['tradingsymbol'] == tradingsymbol:
+                    return inst['instrument_token']
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching instrument token: {e}")
+            return None

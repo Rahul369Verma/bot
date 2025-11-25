@@ -103,51 +103,53 @@ if auth_code and fyers_status == "ok":
     else:
         st.error("Fyers Manager not initialized.")
 
-# --- Kite Login Flow (Only if Real Trading) ---
+# --- Kite Login Flow (ALWAYS AVAILABLE) ---
+# We allow Kite login even in Paper Mode to enable "Smart Exit" and fast data.
 kite_client = None
-if not is_real_trading:
-    st.session_state.kite_toast_shown = False
+kite_api_key = os.getenv("KITE_API_KEY")
+kite_api_secret = os.getenv("KITE_API_SECRET")
 
-if is_real_trading:
-    kite_api_key = os.getenv("KITE_API_KEY")
-    kite_api_secret = os.getenv("KITE_API_SECRET")
-    
-    if 'kite_access_token' not in st.session_state:
-        st.session_state.kite_access_token = None
+if 'kite_access_token' not in st.session_state:
+    st.session_state.kite_access_token = None
 
-    # Check for request_token in URL (callback from Kite)
-    query_params = st.query_params
-    request_token = query_params.get("request_token")
+# Check for request_token in URL (callback from Kite)
+query_params = st.query_params
+request_token = query_params.get("request_token")
 
-    if st.session_state.kite_access_token is None:
-        if request_token:
-            try:
-                from kiteconnect import KiteConnect
-                kite = KiteConnect(api_key=kite_api_key)
-                data = kite.generate_session(request_token, api_secret=kite_api_secret)
-                st.session_state.kite_access_token = data["access_token"]
-                st.success("✅ Logged in to Kite successfully!")
-                # Clear query params to avoid re-login on reload
-                st.query_params.clear()
-            except Exception as e:
-                st.error(f"Kite Login Failed: {e}")
-        else:
-            login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={kite_api_key}"
+if st.session_state.kite_access_token is None:
+    if request_token:
+        try:
+            from kiteconnect import KiteConnect
+            kite = KiteConnect(api_key=kite_api_key)
+            data = kite.generate_session(request_token, api_secret=kite_api_secret)
+            st.session_state.kite_access_token = data["access_token"]
+            st.success("✅ Logged in to Kite successfully!")
+            # Clear query params to avoid re-login on reload
+            st.query_params.clear()
+        except Exception as e:
+            st.error(f"Kite Login Failed: {e}")
+    else:
+        # Only show login link if Real Trading OR if user wants to connect for Paper Mode data
+        login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={kite_api_key}"
+        if is_real_trading:
             st.warning("⚠️ Real Trading Enabled but not logged in.")
             st.markdown(f"[👉 Click here to Login to Kite]({login_url})")
-            st.stop() # Stop execution until logged in
-            
-    if st.session_state.kite_access_token:
-        kite_client = init_kite_client(kite_api_key, kite_api_secret, st.session_state.kite_access_token, paper=False)
-        if kite_client:
-            if 'kite_toast_shown' not in st.session_state:
-                st.session_state.kite_toast_shown = False
-            
-            if not st.session_state.kite_toast_shown:
-                st.toast("Connected to Kite for Real Trading", icon="🚀")
-                st.session_state.kite_toast_shown = True
+            st.stop() # Stop execution until logged in for Real Mode
+        else:
+            # In Paper Mode, show optional login
+            st.sidebar.markdown(f"[👉 Login to Kite (Optional)]({login_url})")
+        
+if st.session_state.kite_access_token:
+    kite_client = init_kite_client(kite_api_key, kite_api_secret, st.session_state.kite_access_token, paper=False)
+    if kite_client:
+        if 'kite_toast_shown' not in st.session_state:
+            st.session_state.kite_toast_shown = False
+        
+        if not st.session_state.kite_toast_shown:
+            st.toast("Connected to Kite", icon="🚀")
+            st.session_state.kite_toast_shown = True
 
-# Initialize Angel Client (Inject Kite Client if Real Mode)
+# Initialize Angel Client (Inject Kite Client if available)
 angel = init_angel_client(
     index_name=selected_index, 
     _fyers_manager=fyers_manager, 
@@ -179,7 +181,10 @@ with threading.Lock():
 st.title(f"🎯 {selected_index} Live Trading Bot {'(PAPER MODE)' if angel and angel.paper else '(REAL MONEY MODE)'}")
 
 if angel and angel.paper:
-    st.success("Bot is in PAPER TRADING mode. No real money will be used.")
+    if kite_client:
+        st.success("Bot is in PAPER TRADING mode (Using Kite Data & Smart Exit).")
+    else:
+        st.info("Bot is in PAPER TRADING mode (Using Standard Data). Login to Kite for Smart Exit.")
 else:
     st.error("WARNING: Bot is in REAL MONEY mode. Real trades will be placed.")
 

@@ -217,7 +217,10 @@ class FyersDataManager:
             
         fyers_symbol = FYERS_INDEX_SYMBOL_MAP.get(index_name)
         if not fyers_symbol:
-            raise Exception(f"Invalid index name: {index_name}.")
+            # Assume it's a stock if not in the index map
+            fyers_symbol = f"NSE:{index_name}-EQ"
+            if is_backtest_log:
+                print(f"Assuming stock symbol for {index_name}: {fyers_symbol}")
             
         if is_backtest_log:
             print(f"Fetching Fyers data for {fyers_symbol} from {start_date} to {end_date}...")
@@ -310,7 +313,8 @@ class FyersDataManager:
 
         underlying = FYERS_OPTION_SYMBOL_MAP.get(index_name)
         if not underlying:
-            raise Exception(f"Invalid option index name: {index_name}")
+            # Assume it's a stock, underlying is usually the symbol name itself
+            underlying = index_name
         
         discontinuation_date = date(2024, 11, 14)
         trade_date_only = trade_date
@@ -372,6 +376,8 @@ class FyersDataManager:
             return 0.0
         
         fyers_symbol = FYERS_INDEX_SYMBOL_MAP.get(index_name)
+        if not fyers_symbol:
+             fyers_symbol = f"NSE:{index_name}-EQ"
         data = {"symbols": fyers_symbol}
         
         try:

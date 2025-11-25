@@ -28,6 +28,8 @@ except ImportError:
 
 IST = ZoneInfo('Asia/Kolkata')
 
+from utils.constants import LOT_SIZE_MAP
+
 class AngelClient:
     """
     Complete Angel Client with automated signal generation
@@ -60,7 +62,10 @@ class AngelClient:
             print(f"✅ Angel Client initialized in PAPER TRADING mode for {self.index_name}.")
 
         # --- Trading State ---
-        self.lot_size = 35 
+        # Dynamic Lot Size
+        self.lot_size = LOT_SIZE_MAP.get(self.index_name, 1) # Default to 1 if not found
+        print(f"AngelClient: Lot Size set to {self.lot_size} for {self.index_name}")
+        
         self.min_investment = 10000
         self.simulated_premium_pct = 0.008 
         self.assumed_delta = 0.5 
@@ -223,6 +228,16 @@ class AngelClient:
         except Exception as e: raise Exception(f"Failed to get expiry dates: {e}")
 
     def get_option_ltp(self, tradingsymbol: str, expiry_hint: str) -> float:
+        # Use Kite Client if available (Faster & More Reliable)
+        if self.kite_client and not self.kite_client.paper:
+            try:
+                quote = self.kite_client.get_quote(tradingsymbol, "NFO")
+                if quote and 'last_price' in quote:
+                    return float(quote['last_price'])
+            except Exception as e:
+                print(f"⚠️ Kite LTP fetch failed for {tradingsymbol}: {e}")
+        
+        # Fallback to NSE Scraper (RealMarketData)
         try:
             chain = self.get_option_chain(expiry=expiry_hint)
             for item in chain:
@@ -437,26 +452,90 @@ class AngelClient:
             return {"status": False, "message": f"Manual trade failed: {e}"}
     
     def check_and_close_positions(self):
-        # ... (no change) ...
+        """
+        Checks open positions for Stop Loss or Take Profit hits.
+        Uses 'Smart Exit' logic if Kite Client is available (checking 1-min candle High/Low).
+        """
         open_symbols = list(self.positions_map.keys())
         if not open_symbols: return
+
         now_ist = datetime.now(IST)
         auto_square_off_time = dt_time(15, 19)
         is_eod_square_off = now_ist.time() >= auto_square_off_time
+        
         for symbol in open_symbols:
             try:
-                pos = self.positions_map[symbol]; expiry = pos.get('expiry') 
-                ltp = self.get_option_ltp(symbol, expiry_hint=expiry)
-                sl_price = pos.get('stop_loss'); tp_price = pos.get('take_profit')
-                sl_hit = ltp <= sl_price; tp_hit = ltp >= tp_price
-                if sl_hit or tp_hit or is_eod_square_off:
-                    reason = "STOP_LOSS" if sl_hit else ("TAKE_PROFIT" if tp_hit else "EOD_SQUARE_OFF")
-                    print(f"🔥 {reason} HIT for {symbol} at LTP {ltp} (SL: {sl_price}, TP: {tp_price})")
-                    result = self.place_order(tradingsymbol=symbol, transaction_type="SELL", quantity=pos['qty'], price=ltp, is_exit=True)
-                    if (sl_hit or (is_eod_square_off and (ltp < pos['avg_price']))) and self.daily_pnl <= -abs(self.max_daily_loss):
+                pos = self.positions_map[symbol]
+                expiry = pos.get('expiry')
+                sl_price = pos.get('stop_loss')
+                tp_price = pos.get('take_profit')
+                
+                # --- SMART EXIT LOGIC ---
+                # If we have Kite Client, fetch 1-min candle to capture wicks
+                triggered = False
+                exit_price = 0.0
+                reason = ""
+                
+                current_ltp = self.get_option_ltp(symbol, expiry_hint=expiry)
+                
+                if self.kite_client and not self.kite_client.paper:
+                    # Fetch last 1-min candle
+                    try:
+                        token = self.kite_client.get_instrument_token(symbol, "NFO")
+                        if token:
+                            to_date = datetime.now(IST)
+                            from_date = to_date - timedelta(minutes=2) # Fetch last 2 mins to be safe
+                            candles = self.kite_client.get_historical_data(token, from_date.strftime('%Y-%m-%d %H:%M:%S'), to_date.strftime('%Y-%m-%d %H:%M:%S'), "minute")
+                            
+                            if candles:
+                                last_candle = candles[-1]
+                                candle_low = last_candle['low']
+                                candle_high = last_candle['high']
+                                
+                                # Check SL (Low <= SL)
+                                if candle_low <= sl_price:
+                                    triggered = True
+                                    reason = "STOP_LOSS (Smart Exit - Wick)"
+                                    exit_price = sl_price # Assume we got out at SL
+                                    print(f"⚡ Smart Exit Triggered for {symbol}: Candle Low {candle_low} <= SL {sl_price}")
+                                
+                                # Check TP (High >= TP)
+                                elif candle_high >= tp_price:
+                                    triggered = True
+                                    reason = "TAKE_PROFIT (Smart Exit - Wick)"
+                                    exit_price = tp_price # Assume we got out at TP
+                                    print(f"⚡ Smart Exit Triggered for {symbol}: Candle High {candle_high} >= TP {tp_price}")
+                    except Exception as e:
+                        print(f"⚠️ Smart Exit check failed for {symbol}: {e}")
+                
+                # Fallback to standard LTP check if Smart Exit didn't trigger
+                if not triggered:
+                    sl_hit = current_ltp <= sl_price
+                    tp_hit = current_ltp >= tp_price
+                    
+                    if sl_hit:
+                        triggered = True
+                        reason = "STOP_LOSS"
+                        exit_price = current_ltp
+                    elif tp_hit:
+                        triggered = True
+                        reason = "TAKE_PROFIT"
+                        exit_price = current_ltp
+                    elif is_eod_square_off:
+                        triggered = True
+                        reason = "EOD_SQUARE_OFF"
+                        exit_price = current_ltp
+
+                if triggered:
+                    print(f"🔥 {reason} HIT for {symbol} at Price {exit_price} (LTP: {current_ltp})")
+                    result = self.place_order(tradingsymbol=symbol, transaction_type="SELL", quantity=pos['qty'], price=exit_price, is_exit=True)
+                    
+                    # Check Max Daily Loss
+                    if (reason.startswith("STOP_LOSS") or (reason == "EOD_SQUARE_OFF" and exit_price < pos['avg_price'])) and self.daily_pnl <= -abs(self.max_daily_loss):
                         print(f"--- MAX DAILY LOSS (₹{self.max_daily_loss}) HIT. STOPPING TRADING FOR THE DAY. ---")
+                        
             except Exception as e:
-                print(f"❌ Error checking position {symbol} (Market may be closed): {e}")
+                print(f"❌ Error checking position {symbol}: {e}")
 
     def close_all_live_positions(self) -> Dict[str, Any]:
         # ... (no change) ...
