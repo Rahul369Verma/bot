@@ -16,17 +16,9 @@ try:
 except Exception:
     SmartClient = None
 
-from .real_market_data import RealMarketData
-from .signal_storage import SignalStorage
-try:
-    from backtest.yfinance_data import YFinanceData
-except ImportError:
-    print("CRITICAL: angel_client.py failed to import from 'backtest' module.")
-    raise
+# Imports moved to __init__ to avoid circular dependency
 
 IST = ZoneInfo('Asia/Kolkata')
-
-from utils.constants import LOT_SIZE_MAP
 
 class AngelClient:
     """
@@ -34,6 +26,13 @@ class AngelClient:
     and REALISTIC intraday trading rules.
     """
     def __init__(self, api_key=None, paper=True, index_name="BANKNIFTY", fyers_manager=None, kite_client=None):
+        # --- Imports to avoid circular dependency ---
+        from .real_market_data import RealMarketData
+        from .signal_storage import SignalStorage
+        from backtest.yfinance_data import YFinanceData
+        from utils.constants import LOT_SIZE_MAP
+        from backtest.backtest import MultiTimeframeStrategy
+
         self.paper = paper
         self.api_key = api_key or os.getenv("ANGEL_API_KEY")
         self.client_code = os.getenv("ANGEL_CLIENT_CODE")
@@ -48,7 +47,6 @@ class AngelClient:
         self.signal_storage = SignalStorage()
         
         # --- MODIFIED: Simplified strategy map ---
-        from backtest.backtest import MultiTimeframeStrategy
         self.strategies = {
             'mta_ema_crossover': MultiTimeframeStrategy(),
         }
