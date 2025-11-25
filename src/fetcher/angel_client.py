@@ -89,7 +89,9 @@ class AngelClient:
         self.daily_pnl = 0.0 
         self.signal_check_interval = 30 
         self.trade_lock = threading.Lock()
+        self.trade_lock = threading.Lock()
         self.last_signal_timestamp = None # Initialize here too
+        self.last_signal_check_time = None # Track when we last checked for signals
 
     def check_new_day(self):
         today = datetime.now(IST).date()
@@ -102,7 +104,7 @@ class AngelClient:
             self.last_signal_timestamp = None # Track the last processed candle timestamp
 
     # --- MODIFIED: Added new params ---
-    def set_trading_parameters(self, max_daily_loss=None, max_trades=None, start_time=None, end_time=None):
+    def set_trading_parameters(self, max_daily_loss=None, max_trades=None, start_time=None, end_time=None, min_lot_cost=None):
         """
         Called by the Streamlit UI to update the bot's risk parameters live.
         """
@@ -114,6 +116,8 @@ class AngelClient:
             self.trade_start_time = start_time
         if end_time is not None:
             self.trade_end_time = end_time
+        if min_lot_cost is not None:
+            self.min_investment = min_lot_cost
             
     def set_active_strategy(self, strategy_name: str):
         # ... (no change, but will only ever be one strategy) ...
@@ -254,6 +258,7 @@ class AngelClient:
                 return []
             
             print(f"[DEBUG] Starting Signal Generation at {now_time.strftime('%H:%M:%S')}")
+            self.last_signal_check_time = now_ist # Update check time
             # --- END MODIFIED ---
             
             if self.skip_today: return []

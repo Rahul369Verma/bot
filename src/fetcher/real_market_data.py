@@ -95,6 +95,10 @@ class RealMarketData:
 
     def _fetch_nse_option_data(self, symbol: str) -> Dict[str, Any]:
         # ... (no change) ...
+        # Map "NIFTY 50" to "NIFTY" for NSE API
+        if symbol == "NIFTY 50": symbol = "NIFTY"
+        if symbol == "BANKNIFTY": symbol = "BANKNIFTY"
+        
         api_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
         try:
             response = self.session.get(api_url, timeout=10)
@@ -200,14 +204,13 @@ class RealMarketData:
                         "volume": float(ce.get('totalTradedVolume', 0)), "iv": float(ce.get('impliedVolatility', 0)),
                         "bid": float(ce.get('bidprice', 0)), "ask": float(ce.get('askPrice', 0))
                     })
-                if 'PE' in item:
                     pe = item['PE']
                     option_chain.append({
                         "tradingsymbol": f"{symbol}{expiry_str}{int(pe['strikePrice'])}PE",
                         "strike": float(pe['strikePrice']), "type": "PE", "expiry": pe['expiryDate'],
                         "ltp": float(pe.get('lastPrice', 0)), "oi": float(pe.get('openInterest', 0)),
                         "volume": float(pe.get('totalTradedVolume', 0)), "iv": float(pe.get('impliedVolatility', 0)),
-                        "bid": float(ce.get('bidprice', 0)), "ask": float(ce.get('askPrice', 0))
+                        "bid": float(pe.get('bidprice', 0)), "ask": float(pe.get('askPrice', 0))
                     })
             if not option_chain:
                 raise Exception(f"No option data found for expiry {expiry_date}.")

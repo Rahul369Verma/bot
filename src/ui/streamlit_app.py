@@ -50,15 +50,17 @@ UI_REFRESH_SECONDS = 300  # 5 minutes - aligned with signal generation to reduce
 # Clean up old logs (24h+)
 # ---------------------------
 if 'log_cleanup_done' not in st.session_state:
+    print("🧹 Starting Log Cleanup...")
     try:
         from utils.log_utils import cleanup_old_logs
         cleanup_old_logs(max_age_hours=24)
+        print("✅ Log Cleanup Finished.")
         st.session_state.log_cleanup_done = True
-    except ImportError:
-        # print("⚠️ Log utils not found. Skipping log cleanup.")
+    except ImportError as e:
+        print(f"❌ Log Cleanup Failed (ImportError): {e}")
         st.session_state.log_cleanup_done = True
     except Exception as e:
-        print(f"⚠️ Error during log cleanup: {e}")
+        print(f"❌ Log Cleanup Failed: {e}")
         st.session_state.log_cleanup_done = True 
 
 # ---------------------------
@@ -76,6 +78,30 @@ strategy_name_map = {
 }
 
 fyers_manager = init_fyers_manager()
+
+# --- Fyers Login Flow ---
+# Check for auth_code in URL (callback from Fyers)
+query_params = st.query_params
+auth_code = query_params.get("auth_code")
+fyers_status = query_params.get("s") # 'ok' or 'error'
+
+if auth_code and fyers_status == "ok":
+    if fyers_manager:
+        st.info("🔄 Processing Fyers Login...")
+        try:
+            if fyers_manager.generate_and_save_token(auth_code):
+                st.success("✅ Fyers Login Successful! Token generated.")
+                # Clear query params to avoid re-processing
+                st.query_params.clear()
+                # Force reload to pick up new token
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("❌ Failed to generate Fyers token. Check logs.")
+        except Exception as e:
+            st.error(f"❌ Error during Fyers login: {e}")
+    else:
+        st.error("Fyers Manager not initialized.")
 
 # --- Kite Login Flow (Only if Real Trading) ---
 kite_client = None

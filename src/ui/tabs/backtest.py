@@ -53,7 +53,7 @@ def render_backtest_tab(tester, selected_index, fyers_manager):
         
         rcol1, rcol2, rcol3 = st.columns(3)
         with rcol1: strategy_params['lot_size'] = st.number_input("Lot Size", value=bt_strategy_params_default.get('lot_size', 35), min_value=1, key="bt_lot_size")
-        with rcol2: strategy_params['min_investment'] = st.number_input("Min. Invest (₹)", value=bt_strategy_params_default.get('min_investment', 10000), min_value=1000, key="bt_min_invest")
+        with rcol2: strategy_params['min_investment'] = st.number_input("Min. Invest (₹)", value=bt_strategy_params_default.get('min_investment', 10000), min_value=10, key="bt_min_invest")
         
         with rcol3:
             if "Simulated" in backtest_mode:

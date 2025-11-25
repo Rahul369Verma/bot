@@ -8,6 +8,18 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
     # ---------------------------
     # Bot Status Dashboard
     # ---------------------------
+    
+    # --- Auto-Refresh Logic (Moved to Top) ---
+    if not st.session_state.optimizer_running and not st.session_state.backtest_running and st.session_state.get('backtest_result') is None and not st.session_state.ai_training_running:
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            # Create a container for the refresh timer/status
+            with st.empty():
+                st_autorefresh(interval=ui_refresh_seconds * 1000, limit=None, key="ui_refresh")
+                # Optional: Add a visual indicator that refresh is active
+                # st.caption(f"🔄 Auto-refresh active (Every {ui_refresh_seconds}s)")
+        except ImportError:
+            st.sidebar.warning("Auto-refresh not installed.\n`pip install streamlit-autorefresh`")
     st.subheader("🤖 Bot Status & Rules")
     if angel:
         st.info(f"Strategy: **{strategy_name_map[active_strategy_key]}**")
@@ -58,15 +70,24 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
                 st.write("") # Spacer
                 st.write("") # Spacer
                 rsi_os = st.number_input("RSI Oversold", min_value=0, max_value=50, value=default_params.get('rsi_oversold', 30), step=1, key="live_rsi_os")
+            
+            st.divider()
+            min_lot_cost_input = st.number_input(
+                "Min Lot Cost (₹)",
+                value=angel.min_investment,
+                min_value=10, step=1000,
+                help="Minimum cost of one lot to allow trading. Prevents trading cheap/illiquid options.",
+                key="live_min_lot_cost"
+            )
         
         # --- NEW: Update all params in AngelClient/Strategy ---
         if live_strategy:
             # Update live risk params
             angel.set_trading_parameters(
-                max_daily_loss=max_loss_input,
                 max_trades=max_trades_input,
                 start_time=start_time_input,
-                end_time=end_time_input
+                end_time=end_time_input,
+                min_lot_cost=min_lot_cost_input
             )
             # Update live filter params
             live_strategy.parameters['use_adx_filter'] = use_adx
@@ -189,6 +210,12 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
                 ema_diff = ema_data['ema_9'] - ema_data['ema_15']; trend = "BULLISH" if ema_diff > 0 else "BEARISH"
                 st.metric("5m Trend", trend, delta=f"₹{ema_diff:,.2f}")
             with col5: st.metric("Last Update (IST)", fetch_time.strftime("%H:%M:%S"))
+            
+            # Row 2: Signal Check Status
+            row2_col1, row2_col2, row2_col3 = st.columns(3)
+            with row2_col1:
+                last_check = angel.last_signal_check_time.strftime("%H:%M:%S") if angel.last_signal_check_time else "Waiting..."
+                st.metric("Last Signal Check", last_check)
         except Exception as e:
             st.error(f"❌ Failed to load market data: {e}")
             if not is_market_open: st.info("This is expected as the market is closed.")
@@ -327,11 +354,4 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
     # 2. Backtest is running
     # 3. Backtest results are being viewed (so user can analyze without reload)
     # 4. AI Training is running
-    if not st.session_state.optimizer_running and not st.session_state.backtest_running and st.session_state.get('backtest_result') is None and not st.session_state.ai_training_running:
-        try:
-            from streamlit_autorefresh import st_autorefresh
-            st_autorefresh(interval=ui_refresh_seconds * 1000, limit=None, key="ui_refresh")
-        except ImportError:
-            st.sidebar.warning("Auto-refresh not installed.\n`pip install streamlit-autorefresh`")
-            if st.sidebar.button("🔄 Refresh Dashboard"):
-                st.rerun()
+    # Auto-refresh moved to top
