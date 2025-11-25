@@ -20,8 +20,6 @@ from .real_market_data import RealMarketData
 from .signal_storage import SignalStorage
 try:
     from backtest.yfinance_data import YFinanceData
-    # --- MODIFIED: Removed Scalping strategy ---
-    from backtest.backtest import MultiTimeframeStrategy 
 except ImportError:
     print("CRITICAL: angel_client.py failed to import from 'backtest' module.")
     raise
@@ -50,6 +48,7 @@ class AngelClient:
         self.signal_storage = SignalStorage()
         
         # --- MODIFIED: Simplified strategy map ---
+        from backtest.backtest import MultiTimeframeStrategy
         self.strategies = {
             'mta_ema_crossover': MultiTimeframeStrategy(),
         }
