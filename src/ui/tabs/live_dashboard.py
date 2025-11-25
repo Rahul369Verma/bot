@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, time as dt_time
-from ..utils import safe_dataframe_formatting, format_volume, highlight_atm
+from ..ui_utils import safe_dataframe_formatting, format_volume, highlight_atm
 
 def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_name_map, is_market_open, now_ist, ui_refresh_seconds):
     """Renders the Live Dashboard tab."""

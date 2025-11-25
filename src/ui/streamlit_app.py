@@ -19,7 +19,7 @@ if src_dir not in sys.path:
 
 # --- Imports from new modules ---
 try:
-    from ui.utils import (
+    from ui.ui_utils import (
         init_fyers_manager, 
         init_fyers_manager, 
         init_angel_client, 
