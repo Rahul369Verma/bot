@@ -33,6 +33,7 @@ class AngelClient:
         from utils.constants import LOT_SIZE_MAP
         from backtest.backtest import MultiTimeframeStrategy
         from .fyers_socket import FyersSocketManager # --- NEW ---
+        from utils.telegram_bot import TelegramBot # --- NEW ---
 
         self.paper = paper
         self.api_key = api_key or os.getenv("ANGEL_API_KEY")
@@ -47,6 +48,7 @@ class AngelClient:
         self.kite_client = kite_client # Optional: Keep for reference or specific data if needed, but primary is Fyers
 
         self.signal_storage = SignalStorage()
+        self.telegram_bot = TelegramBot() # Initialize Telegram Bot
         
         # --- NEW: Socket Manager ---
         self.socket_manager = None
@@ -584,6 +586,10 @@ class AngelClient:
             # --- NEW: Increment trade count on success ---
             if result.get('status'):
                 self.today_trades_count += 1
+                # --- NOTIFICATION ---
+                if self.telegram_bot.enabled:
+                    msg = f"🚀 *REAL TRADE EXECUTED*\n\nSymbol: `{tradingsymbol}`\nAction: BUY\nQty: {quantity}\nPrice: {option_ltp}\nSL: {stop_loss_price}\nTP: {take_profit_price}\nExpiry: {expiry}"
+                    self.telegram_bot.send_message(msg)
                 
             return result
             
@@ -757,6 +763,13 @@ class AngelClient:
                     self.daily_pnl += pnl 
                     trade_record = {"timestamp": time.time(), "tradingsymbol": tradingsymbol, "transaction_type": "SELL", "quantity": quantity, "price": price, "pnl": pnl, "order_id": order_id}
                     self.trade_history.append(trade_record)
+                    
+                    # --- NOTIFICATION ---
+                    if self.telegram_bot.enabled:
+                        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                        msg = f"{pnl_emoji} *PAPER TRADE EXIT*\n\nSymbol: `{tradingsymbol}`\nAction: SELL\nQty: {quantity}\nPrice: {price}\nPnL: ₹{pnl:.2f}"
+                        self.telegram_bot.send_message(msg)
+
                     return {"status": True, "message": f"PAPER SELL {quantity} {tradingsymbol} @ {price}", "orderId": order_id, "data": trade_record, "trade_pnl": pnl}
                 else: 
                     self.positions_map[tradingsymbol] = {
@@ -768,10 +781,14 @@ class AngelClient:
                     order_record = {"timestamp": time.time(), "tradingsymbol": tradingsymbol, "transaction_type": "BUY", "quantity": quantity, "price": price, "status": order_status, "order_id": order_id}
                     self.orders.append(order_record)
                     
-                    # --- NEW: Subscribe to Socket on Entry ---
                     if self.socket_manager:
                         self.socket_manager.subscribe([tradingsymbol])
                         
+                    # --- NOTIFICATION ---
+                    if self.telegram_bot.enabled:
+                        msg = f"📝 *PAPER TRADE ENTRY*\n\nSymbol: `{tradingsymbol}`\nAction: BUY\nQty: {quantity}\nPrice: {price}\nSL: {stop_loss}\nTP: {take_profit}"
+                        self.telegram_bot.send_message(msg)
+
                     return {"status": True, "message": f"PAPER BUY {quantity} {tradingsymbol} @ {price}", "orderId": order_id, "data": order_record}
             except Exception as e:
                 return {"status": False, "message": f"Paper order failed: {e}"}

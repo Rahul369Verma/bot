@@ -43,6 +43,20 @@ def render_settings_tab(fyers_manager):
                         st.rerun()
                     else:
                         st.error("❌ Failed to reload token. The token file may be missing or invalid.")
+            
+            # --- NEW: Telegram Notification Test ---
+            st.divider()
+            st.subheader("📱 Telegram Notifications")
+            if st.button("🔔 Test Notification", type="secondary", width='stretch'):
+                if 'angel_client' in st.session_state and st.session_state.angel_client:
+                    bot = st.session_state.angel_client.telegram_bot
+                    if bot and bot.enabled:
+                        bot.send_message("🔔 *Test Notification from App* 🔔\n\nIf you see this, your Telegram integration is working perfectly! 🚀")
+                        st.success("✅ Test message sent! Check your Telegram.")
+                    else:
+                        st.error("❌ Telegram Bot is disabled. Check your .env file.")
+                else:
+                    st.error("❌ Angel Client not initialized. Please wait for the bot to start.")
         else:
             st.error("Fyers API is not authenticated.")
             try:

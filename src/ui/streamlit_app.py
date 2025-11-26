@@ -116,6 +116,7 @@ angel = init_angel_client(
     _kite_client=kite_client,
     paper=not is_real_trading
 )
+st.session_state.angel_client = angel # Save to session state for other tabs
 
 # 3. Initialize Session State
 initialize_session_state(fyers_manager)
