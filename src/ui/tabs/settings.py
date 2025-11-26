@@ -21,7 +21,7 @@ def render_settings_tab(fyers_manager):
             st.subheader("🔄 Refresh Token")
             st.info("If you've updated the token file manually or generated a new token, click below to reload it without restarting the app.")
             
-            if st.button("🔄 Refresh Token from File", type="secondary", use_container_width=True):
+            if st.button("🔄 Refresh Token from File", type="secondary", width='stretch'):
                 with st.spinner("Reloading token..."):
                     if fyers_manager.reload_token():
                         # Signal bot to stop

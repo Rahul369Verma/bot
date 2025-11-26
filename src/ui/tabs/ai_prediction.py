@@ -27,7 +27,7 @@ def render_ai_prediction_tab(tester):
     if 'ai_predictor' not in st.session_state:
         st.session_state.ai_predictor = None
 
-    if st.button("🧠 Train & Predict", type="primary", use_container_width=True):
+    if st.button("🧠 Train & Predict", type="primary", width='stretch'):
         st.session_state.ai_training_running = True # Stop auto-refresh
         try:
             from ml.predictor import PricePredictor
@@ -90,7 +90,7 @@ def render_ai_prediction_tab(tester):
         
         # --- AI Backtest Section ---
         st.subheader("🧪 Backtest AI Strategy")
-        if st.button("Run Backtest on Predictions", type="secondary", use_container_width=True):
+        if st.button("Run Backtest on Predictions", type="secondary", width='stretch'):
              if st.session_state.ai_predictor is None:
                  st.error("Model not found. Please train first.")
              else:

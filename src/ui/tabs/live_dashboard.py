@@ -81,7 +81,7 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
                 use_rsi = st.toggle("Use RSI Filter", value=default_params.get('use_rsi_filter', True), key="live_rsi_toggle")
                 rsi_ob = st.number_input("RSI Overbought", min_value=50, max_value=100, value=default_params.get('rsi_overbought', 70), step=1, key="live_rsi_ob")
             with fcol3:
-                st.write("") # Spacer
+                use_1h = st.toggle("Use 1h Filter", value=default_params.get('use_1h_filter', True), key="live_1h_toggle")
                 st.write("") # Spacer
                 rsi_os = st.number_input("RSI Oversold", min_value=0, max_value=50, value=default_params.get('rsi_oversold', 30), step=1, key="live_rsi_os")
             
@@ -109,6 +109,7 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
             live_strategy.parameters['use_rsi_filter'] = use_rsi
             live_strategy.parameters['rsi_overbought'] = rsi_ob
             live_strategy.parameters['rsi_oversold'] = rsi_os
+            live_strategy.parameters['use_1h_filter'] = use_1h # --- NEW: Update 1h filter ---
         
         daily_pnl = angel.daily_pnl 
         skip_today = angel.skip_today
@@ -201,19 +202,19 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
     spot_price = 0.0 
     if angel:
         try:
-            # Cache market data for 5 minutes (aligned with signal generation) to reduce API calls
-            # Floor to 5-minute mark: 04:17 -> 04:15, 04:22 -> 04:20
+            # Cache ONLY EMA data (heavy calculation) for 5 minutes
+            # Spot Price should be FRESH (from Socket)
             cache_minute = (now_ist.minute // 5) * 5
-            cache_key = f"market_data_{selected_index}_{now_ist.strftime('%Y%m%d%H')}{cache_minute:02d}"
+            cache_key = f"market_data_ema_{selected_index}_{now_ist.strftime('%Y%m%d%H')}{cache_minute:02d}"
+            
+            spot_price = angel.get_index_ltp() # Always fresh (Socket > API)
             
             if cache_key not in st.session_state:
-                spot_price = angel.get_index_ltp()
                 ema_data = angel.market_data.calculate_emas(angel.get_5m_historical_data())
                 fetch_time = now_ist
-                st.session_state[cache_key] = {'spot_price': spot_price, 'ema_data': ema_data, 'fetch_time': fetch_time}
+                st.session_state[cache_key] = {'ema_data': ema_data, 'fetch_time': fetch_time}
             else:
                 cached = st.session_state[cache_key]
-                spot_price = cached['spot_price']
                 ema_data = cached['ema_data']
                 fetch_time = cached['fetch_time']
             col1, col2, col3, col4, col5 = st.columns(5)
@@ -251,7 +252,7 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
             with col2: st.metric("Current Value", f"₹{portfolio['total_current_value']:,.2f}")
             with col3: st.metric("Unrealized P&L", f"₹{portfolio['total_unrealized_pnl']:,.2f}", delta=f"{portfolio['total_unrealized_pnl']:,.2f}")
             st.metric("Today's Realized P&L", f"₹{portfolio['daily_realized_pnl']:,.2f}")
-            if st.button("🚨 CLOSE ALL OPEN POSITIONS 🚨", type="primary", use_container_width=True):
+            if st.button("🚨 CLOSE ALL OPEN POSITIONS 🚨", type="primary", width='stretch'):
                 if angel and len(angel.positions_map) > 0:
                     with st.spinner("Closing all positions..."):
                         close_results = angel.close_all_live_positions()

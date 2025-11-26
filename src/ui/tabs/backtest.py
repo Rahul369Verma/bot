@@ -88,6 +88,14 @@ def render_backtest_tab(tester, selected_index, fyers_manager):
             with atr_col3: 
                 strategy_params['atr_sl_multiplier'] = st.number_input("ATR SL Multiplier", value=bt_strategy_params_default.get('atr_sl_multiplier', 1.0), min_value=0.1, step=0.1, format="%.1f", key="bt_atr_sl")
         
+        # --- NEW: Trailing Stop Loss ---
+        tsl_col1, tsl_col2 = st.columns(2)
+        with tsl_col1:
+            strategy_params['use_trailing_sl'] = st.checkbox("Enable Trailing Stop Loss", value=bt_strategy_params_default.get('use_trailing_sl', False), key="bt_use_tsl")
+        with tsl_col2:
+            if strategy_params['use_trailing_sl']:
+                strategy_params['trailing_sl_multiplier'] = st.number_input("Trailing ATR Multiplier", value=bt_strategy_params_default.get('trailing_sl_multiplier', 1.5), min_value=0.1, step=0.1, format="%.1f", key="bt_tsl_mult", help="Distance of Trailing SL from Max Price (in ATRs)")
+        
         # --- NEW: Dynamic Risk Management ---
         strategy_params['use_dynamic_risk'] = st.toggle("Enable Dynamic Risk Management (ADX-based TP)", value=True, help="Adjusts TP Multiplier based on ADX trend strength.")
         
@@ -95,6 +103,16 @@ def render_backtest_tab(tester, selected_index, fyers_manager):
             em_col1, em_col2 = st.columns(2)
             with em_col1: strategy_params['ema_short'] = st.number_input("EMA Short", value=bt_strategy_params_default.get('ema_short', 9), min_value=1, key="bt_ema_s")
             with em_col2: strategy_params['ema_long'] = st.number_input("EMA Long", value=bt_strategy_params_default.get('ema_long', 15), min_value=1, key="bt_ema_l")
+            
+            tf_col1, tf_col2, tf_col3 = st.columns(3)
+            with tf_col1:
+                strategy_params['use_1h_filter'] = st.checkbox("Use 1H Trend Filter", value=bt_strategy_params_default.get('use_1h_filter', True), key="bt_use_1h", help="If checked, trades will only be taken if the 1-hour trend aligns with the 5-minute signal.")
+            with tf_col2:
+                strategy_params['use_30m_filter'] = st.checkbox("Use 30M Trend Filter", value=bt_strategy_params_default.get('use_30m_filter', False), key="bt_use_30m", help="If checked, trades will be taken if 30M trend aligns with the signal.")
+            with tf_col3:
+                strategy_params['use_15m_filter'] = st.checkbox("Use 15M Trend Filter", value=bt_strategy_params_default.get('use_15m_filter', True), key="bt_use_15m", help="If checked, trades will be taken if 15M trend aligns with the signal.")
+            
+            strategy_params['max_trade_duration_minutes'] = st.number_input("Max Trade Duration (mins)", min_value=5, value=bt_strategy_params_default.get('max_trade_duration_minutes', 30), step=5, key="bt_max_dur", help="Close trade if it exceeds this duration.")
         
         # --- NEW: UI for ADX/RSI filters in single backtest ---
         with st.expander("Strategy Filters (ADX & RSI)"):
@@ -122,6 +140,9 @@ def render_backtest_tab(tester, selected_index, fyers_manager):
             # --- NEW: Skip Last Week of Expiry Checkbox ---
             strategy_params['skip_last_week_expiry'] = st.checkbox("Skip Expiry Volatility", value=bt_strategy_params_default.get('skip_last_week_expiry', False), help="Skips high volatility periods before expiry:\n- Monthly Expiry: Skips last 7 days.\n- Weekly Expiry: Skips last 2 days (Tue & Wed).")
             
+            # --- NEW: EMA Ribbon Filter ---
+            strategy_params['use_ema_ribbon'] = st.checkbox("Use EMA Ribbon Filter", value=bt_strategy_params_default.get('use_ema_ribbon', False), help="Only trade if EMA Ribbon (20, 50, 100, 200) is aligned in trend direction.")
+            
             # --- NEW: Candle Size Filter UI ---
             st.markdown("---")
             st.markdown("**Candle Size Filter**")
@@ -133,7 +154,7 @@ def render_backtest_tab(tester, selected_index, fyers_manager):
             with cs_col3:
                 strategy_params['candle_size_factor'] = st.number_input("Size Factor", min_value=0.5, value=bt_strategy_params_default.get('candle_size_factor', 1.0), step=0.1, format="%.1f", key="bt_cs_factor", help="Multiplier for average size. 1.0 = Average, 1.5 = 50% larger than average.")
         
-        if st.button("🚀 RUN INTRADAY BACKTEST", use_container_width=True, type="primary"):
+        if st.button("🚀 RUN INTRADAY BACKTEST", width='stretch', type="primary"):
             if not tester:
                 st.error("StrategyTester not initialized. Check Fyers credentials in Settings.")
             elif "Real Option" in backtest_mode and (not fyers_manager or not fyers_manager.is_authenticated()):
@@ -188,7 +209,7 @@ def render_backtest_tab(tester, selected_index, fyers_manager):
             with c_col2:
                 st.write("") # Spacer
                 st.write("") 
-                if st.button("🗑️ Clear Results & Free Memory", type="primary", use_container_width=True):
+                if st.button("🗑️ Clear Results & Free Memory", type="primary", width='stretch'):
                     st.session_state.backtest_result = None
                     import gc
                     gc.collect()

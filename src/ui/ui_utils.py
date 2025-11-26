@@ -139,6 +139,9 @@ def bot_loop(client: AngelClient, stop_event: threading.Event):
                 signals = client.generate_continuous_signals()
                 t2 = time.time()
                 
+                # --- NEW: Explicit Logging for User ---
+                last_check_str = client.last_signal_check_time.strftime("%H:%M:%S") if client.last_signal_check_time else "N/A"
+                print(f"[INFO] Last Update (IST): {now_ist.strftime('%H:%M:%S')} | Last Signal Check: {last_check_str}")
                 print(f"[DEBUG] Cycle Stats: Checks={t1-t0:.3f}s, Signals={t2-t1:.3f}s")
                 
         except Exception as e:

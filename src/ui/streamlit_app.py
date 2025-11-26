@@ -9,6 +9,7 @@ from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 import streamlit as st
 from dotenv import load_dotenv
+import json
 
 # --- Path Setup ---
 current_file_path = os.path.abspath(__file__)
@@ -44,7 +45,7 @@ except ImportError as e:
 # Load environment variables
 # ---------------------------
 load_dotenv()
-UI_REFRESH_SECONDS = 300  # 5 minutes - aligned with signal generation to reduce API calls     
+UI_REFRESH_SECONDS = 30  # 30 seconds - aligned with bot loop for faster updates     
 
 # ---------------------------
 # Clean up old logs (24h+)
@@ -103,51 +104,10 @@ if auth_code and fyers_status == "ok":
     else:
         st.error("Fyers Manager not initialized.")
 
-# --- Kite Login Flow (ALWAYS AVAILABLE) ---
-# We allow Kite login even in Paper Mode to enable "Smart Exit" and fast data.
+# --- Kite Login Flow Removed ---
+# User switched to Fyers completely.
 kite_client = None
-kite_api_key = os.getenv("KITE_API_KEY")
-kite_api_secret = os.getenv("KITE_API_SECRET")
 
-if 'kite_access_token' not in st.session_state:
-    st.session_state.kite_access_token = None
-
-# Check for request_token in URL (callback from Kite)
-query_params = st.query_params
-request_token = query_params.get("request_token")
-
-if st.session_state.kite_access_token is None:
-    if request_token:
-        try:
-            from kiteconnect import KiteConnect
-            kite = KiteConnect(api_key=kite_api_key)
-            data = kite.generate_session(request_token, api_secret=kite_api_secret)
-            st.session_state.kite_access_token = data["access_token"]
-            st.success("✅ Logged in to Kite successfully!")
-            # Clear query params to avoid re-login on reload
-            st.query_params.clear()
-        except Exception as e:
-            st.error(f"Kite Login Failed: {e}")
-    else:
-        # Only show login link if Real Trading OR if user wants to connect for Paper Mode data
-        login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={kite_api_key}"
-        if is_real_trading:
-            st.warning("⚠️ Real Trading Enabled but not logged in.")
-            st.markdown(f"[👉 Click here to Login to Kite]({login_url})")
-            st.stop() # Stop execution until logged in for Real Mode
-        else:
-            # In Paper Mode, show optional login
-            st.sidebar.markdown(f"[👉 Login to Kite (Optional)]({login_url})")
-        
-if st.session_state.kite_access_token:
-    kite_client = init_kite_client(kite_api_key, kite_api_secret, st.session_state.kite_access_token, paper=False)
-    if kite_client:
-        if 'kite_toast_shown' not in st.session_state:
-            st.session_state.kite_toast_shown = False
-        
-        if not st.session_state.kite_toast_shown:
-            st.toast("Connected to Kite", icon="🚀")
-            st.session_state.kite_toast_shown = True
 
 # Initialize Angel Client (Inject Kite Client if available)
 angel = init_angel_client(
@@ -162,31 +122,46 @@ initialize_session_state(fyers_manager)
 tester = st.session_state.tester
 
 # 4. Start Bot Thread
+# Use a named thread to prevent duplicates across sessions/reloads
+BOT_THREAD_NAME = "AngelBotThread"
+
 with threading.Lock():
-    if 'bot_thread' not in st.session_state or not st.session_state.bot_thread.is_alive():
+    # Check if thread is already running by name
+    existing_thread = None
+    for t in threading.enumerate():
+        if t.name == BOT_THREAD_NAME:
+            existing_thread = t
+            break
+            
+    if existing_thread and existing_thread.is_alive():
+        # Re-attach to session state if missing (e.g. after hard refresh)
+        if 'bot_thread' not in st.session_state or st.session_state.bot_thread != existing_thread:
+            st.session_state.bot_thread = existing_thread
+            print(f"🔄 Re-attached to existing bot thread: {BOT_THREAD_NAME}")
+    else:
+        # Start new thread
         print("🚀 Starting Bot Background Thread...")
         stop_event = threading.Event()
         st.session_state.bot_stop_event = stop_event
         if angel:
-            t = threading.Thread(target=bot_loop, args=(angel, stop_event), daemon=True)
+            t = threading.Thread(target=bot_loop, args=(angel, stop_event), name=BOT_THREAD_NAME, daemon=True)
             t.start()
             st.session_state.bot_thread = t
-            print("✅ Bot background thread is now running.")
+            print(f"✅ Bot background thread started: {BOT_THREAD_NAME}")
         else:
             st.error("Cannot start bot thread: Angel Client failed to initialize.")
-    else:
-        pass # Bot thread is already running
 
 # 5. Main Title & Status
 st.title(f"🎯 {selected_index} Live Trading Bot {'(PAPER MODE)' if angel and angel.paper else '(REAL MONEY MODE)'}")
 
 if angel and angel.paper:
-    if kite_client:
-        st.success("Bot is in PAPER TRADING mode (Using Kite Data & Smart Exit).")
-    else:
-        st.info("Bot is in PAPER TRADING mode (Using Standard Data). Login to Kite for Smart Exit.")
+    st.info("Bot is in PAPER TRADING mode (Using Fyers Data).")
 else:
-    st.error("WARNING: Bot is in REAL MONEY mode. Real trades will be placed.")
+    st.error("WARNING: Bot is in REAL MONEY mode. Real trades will be placed via FYERS.")
+    if not fyers_manager or not fyers_manager.is_authenticated():
+        st.error("❌ Fyers is NOT authenticated. Please login to Fyers to trade.")
+        st.stop()
+
 
 now_ist = datetime.now(IST)
 is_market_open = (now_ist.weekday() < 5) and (dt_time(9, 15) <= now_ist.time() <= dt_time(15, 30))

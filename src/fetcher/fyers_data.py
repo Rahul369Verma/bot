@@ -1,7 +1,7 @@
 import pandas as pd
 from fyers_apiv3 import fyersModel
 from datetime import datetime, timedelta, time as dt_time, date
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, List
 import os
 import json
 import time
@@ -45,6 +45,11 @@ class FyersDataManager:
         self._auth_cache_ttl = 60  # Cache for 60 seconds
         
         self.access_token = self._load_token()
+        
+        # Expose constants
+        self.FYERS_INDEX_SYMBOL_MAP = FYERS_INDEX_SYMBOL_MAP
+        self.FYERS_OPTION_SYMBOL_MAP = FYERS_OPTION_SYMBOL_MAP
+        
         if self.access_token:
             self._initialize_fyers_model()
 
@@ -388,3 +393,135 @@ class FyersDataManager:
         except Exception as e:
             print(f"Error fetching spot: {e}")
             return 0.0
+
+    def get_ltp(self, symbol: str) -> float:
+        """
+        Fetches the Last Traded Price (LTP) for a given symbol from Fyers.
+        Handles 'NSE:' prefix automatically.
+        """
+        if not self.is_authenticated():
+            return 0.0
+            
+        # Ensure NSE: prefix for Fyers
+        if not symbol.startswith("NSE:"):
+            fyers_symbol = f"NSE:{symbol}"
+        else:
+            fyers_symbol = symbol
+            
+        data = {"symbols": fyers_symbol}
+        
+        try:
+            response = self.fyers.quotes(data=data)
+            if response.get("s") == "ok" and response.get("d"):
+                return float(response["d"][0]["v"]["lp"])
+            else:
+                print(f"Fyers LTP fetch failed for {symbol}: {response.get('message')}")
+                return 0.0
+        except Exception as e:
+            return 0.0
+
+    # --- TRADING METHODS (Added for Real Trading) ---
+
+    def place_order(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Places an order using Fyers API.
+        Args:
+            data: Dictionary containing order details.
+                  Required keys: symbol, qty, type, side, productType, limitPrice, stopPrice, validity, offlineOrder, stopLoss, takeProfit
+        """
+        if not self.is_authenticated():
+            return {"s": "error", "message": "Fyers client not authenticated", "code": -1}
+            
+        try:
+            print(f"🚀 Placing Fyers Order: {data}")
+            response = self.fyers.place_order(data=data)
+            print(f"Fyers Order Response: {response}")
+            return response
+        except Exception as e:
+            print(f"❌ Error placing Fyers order: {e}")
+            return {"s": "error", "message": str(e), "code": -1}
+
+    def get_positions(self) -> Dict[str, Any]:
+        """Fetches current positions from Fyers."""
+        if not self.is_authenticated():
+            return {"s": "error", "message": "Fyers client not authenticated"}
+            
+        try:
+            response = self.fyers.positions()
+            return response
+        except Exception as e:
+            print(f"❌ Error fetching Fyers positions: {e}")
+            return {"s": "error", "message": str(e)}
+
+    def get_orders(self) -> Dict[str, Any]:
+        """Fetches order book from Fyers."""
+        if not self.is_authenticated():
+            return {"s": "error", "message": "Fyers client not authenticated"}
+            
+        try:
+            response = self.fyers.orderbook()
+            return response
+        except Exception as e:
+            print(f"❌ Error fetching Fyers orders: {e}")
+            return {"s": "error", "message": str(e)}
+
+    def get_quote(self, symbol: str) -> Dict[str, Any]:
+        """
+        Fetches full quote for a symbol (Depth, OHLC, etc).
+        """
+        if not self.is_authenticated():
+            return {}
+            
+        # Ensure NSE: prefix
+        if not symbol.startswith("NSE:") and not symbol.startswith("MCX:"): # Basic check, might need more robust handling
+             # For options/indices, we might need to be careful. 
+             # Assuming symbol passed is already correct Fyers symbol or needs NSE:
+             if not ":" in symbol:
+                 fyers_symbol = f"NSE:{symbol}"
+             else:
+                 fyers_symbol = symbol
+        else:
+            fyers_symbol = symbol
+
+        data = {"symbols": fyers_symbol}
+        try:
+            response = self.fyers.quotes(data=data)
+            if response.get("s") == "ok" and response.get("d"):
+                return response["d"][0]["v"]
+            return {}
+        except Exception as e:
+            print(f"❌ Error fetching quote for {symbol}: {e}")
+            return {}
+
+    def get_quotes(self, symbols: List[str]) -> Dict[str, Any]:
+        """
+        Fetches quotes for multiple symbols in a single API call.
+        Args:
+            symbols: List of Fyers symbols (e.g., ["NSE:SBIN-EQ", "NSE:NIFTY23NOV19800CE"])
+        Returns:
+            Dictionary mapping symbol -> quote data
+        """
+        if not self.is_authenticated():
+            return {}
+            
+        if not symbols:
+            return {}
+            
+        # Join symbols with comma
+        symbols_str = ",".join(symbols)
+        data = {"symbols": symbols_str}
+        
+        try:
+            response = self.fyers.quotes(data=data)
+            result = {}
+            if response.get("s") == "ok" and response.get("d"):
+                for item in response["d"]:
+                    # Map symbol name back to data
+                    sym = item.get('n')
+                    v = item.get('v')
+                    if sym and v:
+                        result[sym] = v
+            return result
+        except Exception as e:
+            print(f"❌ Error fetching quotes for multiple symbols: {e}")
+            return {}

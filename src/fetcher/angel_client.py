@@ -32,6 +32,7 @@ class AngelClient:
         from backtest.yfinance_data import YFinanceData
         from utils.constants import LOT_SIZE_MAP
         from backtest.backtest import MultiTimeframeStrategy
+        from .fyers_socket import FyersSocketManager # --- NEW ---
 
         self.paper = paper
         self.api_key = api_key or os.getenv("ANGEL_API_KEY")
@@ -41,10 +42,24 @@ class AngelClient:
         self.yfinance_ticker = YFinanceData.INDEX_TICKERS.get(index_name, "^NSEBANK")
         print(f"AngelClient initializing for: {self.index_name} ({self.yfinance_ticker})")
         
-        self.market_data = RealMarketData()
-        self.fyers_manager = fyers_manager # Use Fyers for Index Data
-        self.kite_client = kite_client # Use Kite for Execution
+        self.fyers_manager = fyers_manager # Use Fyers for Index Data AND Execution
+        self.market_data = RealMarketData(self.fyers_manager)
+        self.kite_client = kite_client # Optional: Keep for reference or specific data if needed, but primary is Fyers
+
         self.signal_storage = SignalStorage()
+        
+        # --- NEW: Socket Manager ---
+        self.socket_manager = None
+        if self.fyers_manager and self.fyers_manager.access_token:
+            self.socket_manager = FyersSocketManager(self.fyers_manager.access_token)
+            # Subscribe to Index immediately
+            index_symbol = self.fyers_manager.FYERS_INDEX_SYMBOL_MAP.get(self.index_name)
+            if index_symbol:
+                self.socket_manager.subscribe([index_symbol])
+            
+            # Start Fast Monitor Thread
+            self.fast_monitor_thread = threading.Thread(target=self.start_fast_monitor, daemon=True)
+            self.fast_monitor_thread.start()
         
         # --- MODIFIED: Simplified strategy map ---
         self.strategies = {
@@ -91,9 +106,11 @@ class AngelClient:
         self.daily_pnl = 0.0 
         self.signal_check_interval = 30 
         self.trade_lock = threading.Lock()
-        self.trade_lock = threading.Lock()
         self.last_signal_timestamp = None # Initialize here too
         self.last_signal_check_time = None # Track when we last checked for signals
+        
+        # --- NEW: Sync Open Positions (Enforce Single Trade Limit) ---
+        self.sync_positions()
 
     def check_new_day(self):
         today = datetime.now(IST).date()
@@ -106,6 +123,52 @@ class AngelClient:
             self.last_signal_timestamp = None # Track the last processed candle timestamp
 
     # --- MODIFIED: Added new params ---
+    def sync_positions(self):
+        """
+        Fetches open positions from Fyers (if Real Trading) on startup.
+        Populates positions_map to ensure we don't open new trades if one exists.
+        """
+        if self.paper: return
+        
+        if self.fyers_manager:
+            try:
+                print("🔄 Syncing open positions from Fyers...")
+                fyers_pos = self.fyers_manager.get_positions()
+                net_positions = fyers_pos.get('netPositions', [])
+                
+                found_open = False
+                for p in net_positions:
+                    qty = p.get('netQty', 0)
+                    if qty != 0:
+                        symbol = p.get('symbol')
+                        print(f"⚠️ Found EXISTING Open Position: {symbol} (Qty: {qty})")
+                        
+                        # Add to positions_map to BLOCK new trades
+                        # We don't know original SL/TP, so we set them to safe values to prevent auto-close
+                        # unless EOD or manual.
+                        self.positions_map[symbol] = {
+                            "qty": qty,
+                            "avg_price": p.get('avgPrice', 0),
+                            "stop_loss": 0,       # 0 SL means it won't trigger (unless price goes to 0)
+                            "take_profit": 999999, # High TP means it won't trigger
+                            "expiry": "",         # Unknown expiry
+                            "entry_time": datetime.now(IST), # Unknown entry time
+                            "is_existing": True   # Flag to indicate this was synced
+                        }
+                        found_open = True
+                        
+                        # Subscribe to socket for this symbol
+                        if self.socket_manager:
+                            self.socket_manager.subscribe([symbol])
+                
+                if found_open:
+                    print("🚫 New trades are BLOCKED because an open position exists.")
+                else:
+                    print("✅ No existing open positions found.")
+                    
+            except Exception as e:
+                print(f"❌ Failed to sync positions: {e}")
+
     def set_trading_parameters(self, max_daily_loss=None, max_trades=None, start_time=None, end_time=None, min_lot_cost=None):
         """
         Called by the Streamlit UI to update the bot's risk parameters live.
@@ -142,6 +205,9 @@ class AngelClient:
             return pd.DataFrame()
             
         try:
+            # Get params from active strategy FIRST
+            params = self.strategies[self.active_strategy_name].parameters
+            
             end_date = datetime.now(IST)
             start_date = end_date - timedelta(days=5) # Fetch last 5 days
             
@@ -152,12 +218,14 @@ class AngelClient:
             # 2. Fetch 15m Data
             df_15m = self.fyers_manager.get_historical_index_data(self.index_name, start_date, end_date, "15")
             
-            # 3. Fetch 1h Data
-            df_1h = self.fyers_manager.get_historical_index_data(self.index_name, start_date, end_date, "60")
+            # 3. Fetch 1h Data (Optional)
+            use_1h = params.get('use_1h_filter', True)
+            df_1h = None
+            if use_1h:
+                df_1h = self.fyers_manager.get_historical_index_data(self.index_name, start_date, end_date, "60")
             
             # 4. Calculate Indicators on Higher Timeframes BEFORE merging
-            # Get params from active strategy
-            params = self.strategies[self.active_strategy_name].parameters
+            # params already fetched above
             ema_short = params.get('ema_short', 9)
             ema_long = params.get('ema_long', 15)
             
@@ -171,11 +239,13 @@ class AngelClient:
                 
             # 5. Merge Higher Timeframes to Base (5m)
             df_5m['15m_timestamp'] = df_5m.index.floor('15min')
-            df_5m = pd.merge(df_5m, df_15m[['ema_short_15m', 'ema_long_15m']], left_on='15m_timestamp', right_index=True, how='left')
+            if df_15m is not None and not df_15m.empty and 'ema_short_15m' in df_15m.columns:
+                df_5m = pd.merge(df_5m, df_15m[['ema_short_15m', 'ema_long_15m']], left_on='15m_timestamp', right_index=True, how='left')
             
             # Fix for 1h candles starting at 09:15
-            df_5m['1h_timestamp'] = (df_5m.index - pd.Timedelta(minutes=15)).floor('1h') + pd.Timedelta(minutes=15)
-            df_5m = pd.merge(df_5m, df_1h[['ema_short_1h', 'ema_long_1h']], left_on='1h_timestamp', right_index=True, how='left')
+            if df_1h is not None and not df_1h.empty and 'ema_short_1h' in df_1h.columns:
+                df_5m['1h_timestamp'] = (df_5m.index - pd.Timedelta(minutes=15)).floor('1h') + pd.Timedelta(minutes=15)
+                df_5m = pd.merge(df_5m, df_1h[['ema_short_1h', 'ema_long_1h']], left_on='1h_timestamp', right_index=True, how='left')
             
             # Forward fill to propagate signals
             df_5m.ffill(inplace=True)
@@ -189,10 +259,33 @@ class AngelClient:
     def get_index_ltp(self) -> float:
         """
         Fetches the latest price of the index from Fyers.
+        Prioritizes WebSocket cache for real-time updates.
         """
         if not self.fyers_manager:
             return 0.0
-        return self.fyers_manager.get_index_spot(self.index_name)
+            
+        # 1. Try Socket First
+        if self.socket_manager:
+            index_symbol = self.fyers_manager.FYERS_INDEX_SYMBOL_MAP.get(self.index_name)
+            if index_symbol:
+                socket_ltp = self.socket_manager.get_ltp(index_symbol)
+                if socket_ltp:
+                    return socket_ltp
+        
+        # 2. Fallback to API (with 5s Cache to prevent spam)
+        # Check cache
+        current_time = time.time()
+        if hasattr(self, '_index_ltp_cache'):
+            if current_time - self._index_ltp_cache['timestamp'] < 5:
+                return self._index_ltp_cache['price']
+        
+        # Fetch from API
+        price = self.fyers_manager.get_index_spot(self.index_name)
+        
+        # Update Cache
+        self._index_ltp_cache = {'timestamp': current_time, 'price': price}
+        
+        return price
 
     def get_5m_historical_data(self) -> pd.DataFrame:
         """
@@ -225,7 +318,23 @@ class AngelClient:
         except Exception as e: raise Exception(f"Failed to get expiry dates: {e}")
 
     def get_option_ltp(self, tradingsymbol: str, expiry_hint: str) -> float:
-        # Use Kite Client if available (Faster & More Reliable)
+        # --- MODIFIED: Use Fyers for LTP (Kite Free Account Fix) ---
+        if self.fyers_manager:
+            try:
+                # 1. Try Socket First
+                if self.socket_manager:
+                    socket_ltp = self.socket_manager.get_ltp(tradingsymbol)
+                    if socket_ltp:
+                        return socket_ltp
+                
+                # 2. Fallback to API
+                ltp = self.fyers_manager.get_ltp(tradingsymbol)
+                if ltp > 0:
+                    return ltp
+            except Exception as e:
+                print(f"⚠️ Fyers LTP fetch failed for {tradingsymbol}: {e}")
+        
+        # Fallback to Kite if Fyers fails (or not init) - though likely to fail if permission issue
         if self.kite_client and not self.kite_client.paper:
             try:
                 quote = self.kite_client.get_quote(tradingsymbol, "NFO")
@@ -247,6 +356,21 @@ class AngelClient:
             raise Exception(f"Failed to get option LTP: {e}")
 
     # ----------- Live Trading Logic -----------
+
+    def start_fast_monitor(self):
+        """
+        Runs every 1 second to check SL/TP using WebSocket data.
+        This provides "Scalping" speed exits.
+        """
+        print("🚀 Fast Monitor Thread Started (1s interval)")
+        while True:
+            try:
+                time.sleep(1) # Check every second
+                if self.positions_map:
+                    self.check_and_close_positions(use_socket=True)
+            except Exception as e:
+                print(f"❌ Error in Fast Monitor: {e}")
+                time.sleep(5)
 
     def generate_continuous_signals(self) -> List[Dict[str, Any]]:
         with self.trade_lock:
@@ -362,44 +486,100 @@ class AngelClient:
                     expiry=expiry 
                 )
             else:
-                # REAL TRADING with GTT OCO
-                if self.kite_client:
-                    print(f"🚀 Placing REAL GTT OCO Order for {tradingsymbol}...")
-                    # 1. Place Market Entry Order
-                    entry_result = self.kite_client.place_order(
-                        tradingsymbol=tradingsymbol,
-                        exchange="NFO",
-                        transaction_type="BUY",
-                        quantity=quantity,
-                        product_type="MIS", # Intraday
-                        price=None, # Market Order
-                        tag="bot_entry"
-                    )
+                # REAL TRADING with Fyers
+                if self.fyers_manager:
+                    print(f"🚀 Placing REAL Order via Fyers for {tradingsymbol}...")
                     
-                    if entry_result['status'] == 'success':
-                        print(f"✅ Entry Order Placed: {entry_result['order_id']}")
-                        # 2. Place GTT OCO for SL/TP
-                        gtt_result = self.kite_client.place_gtt_oco(
-                            tradingsymbol=tradingsymbol,
-                            exchange="NFO",
-                            transaction_type="BUY", # Entry was BUY, so GTT handles exit (SELL) internally
-                            quantity=quantity,
-                            product_type="MIS",
-                            price=option_ltp, # Current price for reference
-                            stop_loss_price=stop_loss_price,
-                            target_price=take_profit_price
-                        )
-                        if gtt_result['status'] == 'success':
-                            print(f"✅ GTT OCO Placed: {gtt_result['trigger_id']}")
-                            result = {"status": True, "message": "Real Trade & GTT Placed", "data": entry_result}
+                    # Fyers Order Dict
+                    # 1 = Limit, 2 = Market, 3 = Stop, 4 = StopLimit
+                    # Side: 1 = Buy, -1 = Sell
+                    
+                    # 1. Place Entry Order (Market)
+                    entry_data = {
+                        "symbol": tradingsymbol,
+                        "qty": quantity,
+                        "type": 2, # Market Order
+                        "side": 1, # Buy
+                        "productType": "INTRADAY", # MIS equivalent
+                        "limitPrice": 0,
+                        "stopPrice": 0,
+                        "validity": "DAY",
+                        "disclosedQty": 0,
+                        "offlineOrder": False,
+                    }
+                    
+                    entry_result = self.fyers_manager.place_order(entry_data)
+                    
+                    if entry_result.get("s") == "ok":
+                        order_id = entry_result.get("id")
+                        print(f"✅ Entry Order Placed: {order_id}")
+                        
+                        # 2. Place Stop Loss Order (Stop Limit or Stop Market)
+                        # Fyers doesn't have GTT OCO in API v3 easily accessible like Kite's GTT.
+                        # We will place a separate SL Limit Order.
+                        # Note: For OCO-like behavior, we might need to manage it manually or use 'CO'/'BO' if supported.
+                        # For now, placing a standard Stop Loss Market/Limit order.
+                        
+                        # SL Order (Sell)
+                        sl_data = {
+                            "symbol": tradingsymbol,
+                            "qty": quantity,
+                            "type": 3, # Stop Loss Market (or 4 for SL Limit) - Using SL Market for safety
+                            "side": -1, # Sell
+                            "productType": "INTRADAY",
+                            "limitPrice": 0, # Market
+                            "stopPrice": stop_loss_price,
+                            "validity": "DAY",
+                            "disclosedQty": 0,
+                            "offlineOrder": False,
+                        }
+                        
+                        # Target Order (Limit Sell)
+                        tp_data = {
+                            "symbol": tradingsymbol,
+                            "qty": quantity,
+                            "type": 1, # Limit
+                            "side": -1, # Sell
+                            "productType": "INTRADAY",
+                            "limitPrice": take_profit_price,
+                            "stopPrice": 0,
+                            "validity": "DAY",
+                            "disclosedQty": 0,
+                            "offlineOrder": False,
+                        }
+                        
+                        # Place SL
+                        sl_result = self.fyers_manager.place_order(sl_data)
+                        if sl_result.get("s") == "ok":
+                             print(f"✅ SL Order Placed: {sl_result.get('id')}")
                         else:
-                            print(f"❌ GTT Failed: {gtt_result.get('message')}")
-                            result = {"status": True, "message": "Entry Success but GTT Failed!", "data": entry_result} # Trade is open, but no SL!
+                             print(f"❌ SL Order Failed: {sl_result.get('message')}")
+
+                        # Place TP
+                        tp_result = self.fyers_manager.place_order(tp_data)
+                        if tp_result.get("s") == "ok":
+                             print(f"✅ TP Order Placed: {tp_result.get('id')}")
+                        else:
+                             print(f"❌ TP Order Failed: {tp_result.get('message')}")
+                             
+                        # --- NEW: Track Real Position in Bot Memory ---
+                        self.positions_map[tradingsymbol] = {
+                            "qty": quantity, 
+                            "avg_price": option_ltp, # Approximate until we fetch order book
+                            "stop_loss": stop_loss_price, 
+                            "take_profit": take_profit_price,
+                            "expiry": expiry,
+                            "entry_time": datetime.now(IST)
+                        }
+                             
+                        result = {"status": True, "message": "Real Trade Placed (Entry + SL + TP)", "data": entry_result}
+                        
                     else:
                         print(f"❌ Entry Failed: {entry_result.get('message')}")
                         result = {"status": False, "message": f"Entry Failed: {entry_result.get('message')}"}
                 else:
-                    result = {"status": False, "message": "Kite Client not initialized for Real Trading."}
+                    result = {"status": False, "message": "Fyers Manager not initialized for Real Trading."}
+
             
             # --- NEW: Increment trade count on success ---
             if result.get('status'):
@@ -427,7 +607,7 @@ class AngelClient:
             return {"status": False, "message": "SKIPPED: Lot cost was < ₹10k earlier today."}
         if self.daily_pnl <= -abs(self.max_daily_loss): 
             return {"status": False, "message": f"STOPPED: Max daily loss of ₹{self.max_daily_loss} was hit."}
-        if now_time >= dt_time(15, 19):
+        if now_time >= dt_time(15, 15):
             return {"status": False, "message": "Cannot open manual trades after 3:19 PM."}
             
         try:
@@ -448,16 +628,16 @@ class AngelClient:
         except Exception as e:
             return {"status": False, "message": f"Manual trade failed: {e}"}
     
-    def check_and_close_positions(self):
+    def check_and_close_positions(self, use_socket: bool = False):
         """
         Checks open positions for Stop Loss or Take Profit hits.
-        Uses 'Smart Exit' logic if Kite Client is available (checking 1-min candle High/Low).
+        Uses Socket Data if available (Fast), else API (Slow).
         """
         open_symbols = list(self.positions_map.keys())
         if not open_symbols: return
 
         now_ist = datetime.now(IST)
-        auto_square_off_time = dt_time(15, 19)
+        auto_square_off_time = dt_time(15, 15)
         is_eod_square_off = now_ist.time() >= auto_square_off_time
         
         for symbol in open_symbols:
@@ -466,69 +646,67 @@ class AngelClient:
                 expiry = pos.get('expiry')
                 sl_price = pos.get('stop_loss')
                 tp_price = pos.get('take_profit')
+                entry_time = pos.get('entry_time')
                 
-                # --- SMART EXIT LOGIC ---
-                # If we have Kite Client, fetch 1-min candle to capture wicks
-                triggered = False
-                exit_price = 0.0
-                reason = ""
-                
-                current_ltp = self.get_option_ltp(symbol, expiry_hint=expiry)
-                
-                if self.kite_client and not self.kite_client.paper:
-                    # Fetch last 1-min candle
-                    try:
-                        token = self.kite_client.get_instrument_token(symbol, "NFO")
-                        if token:
-                            to_date = datetime.now(IST)
-                            from_date = to_date - timedelta(minutes=2) # Fetch last 2 mins to be safe
-                            candles = self.kite_client.get_historical_data(token, from_date.strftime('%Y-%m-%d %H:%M:%S'), to_date.strftime('%Y-%m-%d %H:%M:%S'), "minute")
-                            
-                            if candles:
-                                last_candle = candles[-1]
-                                candle_low = last_candle['low']
-                                candle_high = last_candle['high']
-                                
-                                # Check SL (Low <= SL)
-                                if candle_low <= sl_price:
-                                    triggered = True
-                                    reason = "STOP_LOSS (Smart Exit - Wick)"
-                                    exit_price = sl_price # Assume we got out at SL
-                                    print(f"⚡ Smart Exit Triggered for {symbol}: Candle Low {candle_low} <= SL {sl_price}")
-                                
-                                # Check TP (High >= TP)
-                                elif candle_high >= tp_price:
-                                    triggered = True
-                                    reason = "TAKE_PROFIT (Smart Exit - Wick)"
-                                    exit_price = tp_price # Assume we got out at TP
-                                    print(f"⚡ Smart Exit Triggered for {symbol}: Candle High {candle_high} >= TP {tp_price}")
-                    except Exception as e:
-                        print(f"⚠️ Smart Exit check failed for {symbol}: {e}")
-                
-                # Fallback to standard LTP check if Smart Exit didn't trigger
-                if not triggered:
-                    sl_hit = current_ltp <= sl_price
-                    tp_hit = current_ltp >= tp_price
+                # --- NEW: Max Duration Check (Only in Slow Loop) ---
+                if not use_socket:
+                    active_strategy = self.strategies.get(self.active_strategy_name)
+                    max_duration = 30 # Default
+                    if active_strategy:
+                        max_duration = active_strategy.parameters.get('max_trade_duration_minutes', 30)
                     
-                    if sl_hit:
-                        triggered = True
-                        reason = "STOP_LOSS"
-                        exit_price = current_ltp
-                    elif tp_hit:
-                        triggered = True
-                        reason = "TAKE_PROFIT"
-                        exit_price = current_ltp
-                    elif is_eod_square_off:
-                        triggered = True
-                        reason = "EOD_SQUARE_OFF"
-                        exit_price = current_ltp
+                    if entry_time:
+                        duration_mins = (now_ist - entry_time).total_seconds() / 60
+                        if duration_mins > max_duration:
+                            print(f"⏰ Max Duration ({max_duration}m) Exceeded for {symbol}. Closing...")
+                            self.place_order(tradingsymbol=symbol, transaction_type="SELL", quantity=pos['qty'], price=0, is_exit=True)
+                            continue
+
+                # --- PRICE CHECK ---
+                current_ltp = 0.0
+                source = "API"
+                
+                # 1. Try Socket First
+                if self.socket_manager:
+                    socket_ltp = self.socket_manager.get_ltp(symbol)
+                    if socket_ltp:
+                        current_ltp = socket_ltp
+                        source = "SOCKET"
+                
+                # 2. Fallback to API (Only if not using socket-only mode or socket failed)
+                if current_ltp == 0.0:
+                    if use_socket: continue # Don't block fast thread with API calls
+                    current_ltp = self.get_option_ltp(symbol, expiry_hint=expiry)
+                
+                if current_ltp == 0.0: continue
+
+                triggered = False
+                reason = ""
+                exit_price = current_ltp
+                
+                sl_hit = current_ltp <= sl_price
+                tp_hit = current_ltp >= tp_price
+                
+                if sl_hit:
+                    triggered = True
+                    reason = f"STOP_LOSS ({source})"
+                elif tp_hit:
+                    triggered = True
+                    reason = f"TAKE_PROFIT ({source})"
+                elif is_eod_square_off and not use_socket:
+                    triggered = True
+                    reason = "EOD_SQUARE_OFF"
 
                 if triggered:
-                    print(f"🔥 {reason} HIT for {symbol} at Price {exit_price} (LTP: {current_ltp})")
-                    result = self.place_order(tradingsymbol=symbol, transaction_type="SELL", quantity=pos['qty'], price=exit_price, is_exit=True)
+                    print(f"🔥 {reason} HIT for {symbol} at {current_ltp} (SL: {sl_price}, TP: {tp_price})")
+                    # Unsubscribe from socket on exit
+                    if self.socket_manager:
+                        self.socket_manager.unsubscribe([symbol])
+                        
+                    result = self.place_order(tradingsymbol=symbol, transaction_type="SELL", quantity=pos['qty'], price=current_ltp, is_exit=True)
                     
-                    # Check Max Daily Loss
-                    if (reason.startswith("STOP_LOSS") or (reason == "EOD_SQUARE_OFF" and exit_price < pos['avg_price'])) and self.daily_pnl <= -abs(self.max_daily_loss):
+                    # Check Max Daily Loss (Only in slow loop or if critical)
+                    if not use_socket and (reason.startswith("STOP_LOSS") or (reason == "EOD_SQUARE_OFF" and current_ltp < pos['avg_price'])) and self.daily_pnl <= -abs(self.max_daily_loss):
                         print(f"--- MAX DAILY LOSS (₹{self.max_daily_loss}) HIT. STOPPING TRADING FOR THE DAY. ---")
                         
             except Exception as e:
@@ -584,27 +762,45 @@ class AngelClient:
                     self.positions_map[tradingsymbol] = {
                         "qty": quantity, "avg_price": price,
                         "stop_loss": stop_loss, "take_profit": take_profit,
-                        "expiry": expiry 
+                        "expiry": expiry,
+                        "entry_time": datetime.now(IST) # Track entry time
                     }
                     order_record = {"timestamp": time.time(), "tradingsymbol": tradingsymbol, "transaction_type": "BUY", "quantity": quantity, "price": price, "status": order_status, "order_id": order_id}
                     self.orders.append(order_record)
+                    
+                    # --- NEW: Subscribe to Socket on Entry ---
+                    if self.socket_manager:
+                        self.socket_manager.subscribe([tradingsymbol])
+                        
                     return {"status": True, "message": f"PAPER BUY {quantity} {tradingsymbol} @ {price}", "orderId": order_id, "data": order_record}
             except Exception as e:
                 return {"status": False, "message": f"Paper order failed: {e}"}
         else:
             # REAL TRADING
-            if self.kite_client:
-                return self.kite_client.place_order(
-                    tradingsymbol=tradingsymbol,
-                    exchange="NFO",
-                    transaction_type=transaction_type,
-                    quantity=quantity,
-                    product_type="MIS",
-                    price=price
-                )
+            if self.fyers_manager:
+                # Side: 1 = Buy, -1 = Sell
+                side = 1 if transaction_type == "BUY" else -1
+                
+                data = {
+                    "symbol": tradingsymbol if tradingsymbol.startswith("NSE:") else f"NSE:{tradingsymbol}",
+                    "qty": quantity,
+                    "type": 2, # Market
+                    "side": side,
+                    "productType": "INTRADAY",
+                    "limitPrice": 0,
+                    "stopPrice": 0,
+                    "validity": "DAY",
+                    "disclosedQty": 0,
+                    "offlineOrder": False,
+                }
+                if price is not None:
+                    data["type"] = 1 # Limit
+                    data["limitPrice"] = price
+                    
+                return self.fyers_manager.place_order(data)
             else:
-                print("--- REAL TRADING IS NOT IMPLEMENTED OR KITE CLIENT MISSING ---")
-                return {"status": False, "message": "Real trading logic is not implemented or Kite Client missing."}
+                print("--- REAL TRADING IS NOT IMPLEMENTED OR FYERS MANAGER MISSING ---")
+                return {"status": False, "message": "Real trading logic is not implemented or Fyers Manager missing."}
 
     def get_positions(self) -> List[Dict[str, Any]]:
         if self.paper:
@@ -618,28 +814,37 @@ class AngelClient:
             return positions
         else:
             # REAL TRADING
-            if self.kite_client:
+            if self.fyers_manager:
                 try:
-                    kite_pos = self.kite_client.get_positions()
-                    # We focus on 'net' positions which show current open positions
-                    net_positions = kite_pos.get('net', [])
+                    fyers_pos = self.fyers_manager.get_positions()
+                    # Fyers positions structure: {'s': 'ok', 'netPositions': [...], 'overall': {...}}
+                    net_positions = fyers_pos.get('netPositions', [])
                     mapped_positions = []
                     for p in net_positions:
-                        if p['quantity'] != 0:
+                        if p['netQty'] != 0:
+                            current_price = p['ltp']
+                            
+                            # Override with Socket Price if available
+                            if self.socket_manager:
+                                socket_ltp = self.socket_manager.get_ltp(p['symbol'])
+                                if socket_ltp:
+                                    current_price = socket_ltp
+                                    
                             mapped_positions.append({
-                                "tradingsymbol": p['tradingsymbol'],
-                                "qty": p['quantity'],
-                                "avg_price": p['average_price'],
-                                "current_price": p['last_price'],
-                                "unrealized_pnl": p['pnl'],
-                                "sl": 0, # Not available directly from Kite positions
+                                "tradingsymbol": p['symbol'],
+                                "qty": p['netQty'],
+                                "avg_price": p['avgPrice'],
+                                "current_price": current_price, # Updated with Socket
+                                "unrealized_pnl": (current_price - p['avgPrice']) * p['netQty'], # Recalculate P&L
+                                "sl": 0, 
                                 "tp": 0
                             })
                     return mapped_positions
                 except Exception as e:
-                    print(f"Error fetching Kite positions: {e}")
+                    print(f"Error fetching Fyers positions: {e}")
                     return []
             return []
+
     def get_trade_history(self) -> List[Dict[str, Any]]: return self.trade_history
     def get_daily_pnl(self) -> float: return self.daily_pnl
     def get_portfolio_value(self) -> Dict[str, float]:

@@ -24,7 +24,8 @@ class RealMarketData:
     - YFinanceData for Spot/Historical Index data. (CHANGED)
     - Direct NSE API for Option Chain data.
     """
-    def __init__(self):
+    def __init__(self, fyers_manager=None):
+        self.fyers_manager = fyers_manager
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -33,7 +34,7 @@ class RealMarketData:
             'Referer': 'https://www.nseindia.com/',
             'Origin': 'https://www.nseindia.com',
         })
-        self._setup_session()
+        # self._setup_session() # NSE Session no longer needed immediately, but kept for fallback if needed
         
         self.hist_data_manager = YFinanceData()
         
@@ -106,6 +107,15 @@ class RealMarketData:
         elif symbol == "NIFTY": # Handle if passed directly
             is_index = True
         
+        # --- NEW: Caching Logic ---
+        # Check if we have a valid cached response (less than 60 seconds old)
+        current_time = time.time()
+        if hasattr(self, '_nse_cache') and symbol in self._nse_cache:
+            cache_entry = self._nse_cache[symbol]
+            if current_time - cache_entry['timestamp'] < 60:
+                # print(f"Using cached NSE data for {symbol}")
+                return cache_entry['data']
+        
         # Construct URL based on type (Index vs Equity)
         if is_index:
             api_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
@@ -118,13 +128,33 @@ class RealMarketData:
             print(f"Fetching NSE Option Chain for {symbol} (Index={is_index})...")
             response = self.session.get(api_url, timeout=10)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            
+            # Update Cache
+            if not hasattr(self, '_nse_cache'): self._nse_cache = {}
+            self._nse_cache[symbol] = {'timestamp': current_time, 'data': data}
+            
+            return data
         except Exception as e:
             print(f"❌ Failed to fetch from NSE API for {symbol}: {e}")
             self._setup_session()
-            response = self.session.get(api_url, timeout=10)
-            response.raise_for_status()
-            return response.json()
+            try:
+                response = self.session.get(api_url, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Update Cache
+                if not hasattr(self, '_nse_cache'): self._nse_cache = {}
+                self._nse_cache[symbol] = {'timestamp': current_time, 'data': data}
+                
+                return data
+            except Exception as e2:
+                print(f"❌ Retry failed: {e2}")
+                # Return cached data if available (even if expired) as fallback
+                if hasattr(self, '_nse_cache') and symbol in self._nse_cache:
+                    print("⚠️ Returning expired cache as fallback.")
+                    return self._nse_cache[symbol]['data']
+                raise e
 
     def _analyze_expiry_type(self, expiry_dates: List[str]) -> Dict[str, Any]:
         """
@@ -201,7 +231,133 @@ class RealMarketData:
             return expirations
 
     def get_banknifty_option_chain(self, symbol: str, expiry_date: str) -> List[Dict[str, Any]]:
-        # ... (no change) ...
+        """
+        Fetches Option Chain using Fyers API (via FyersDataManager).
+        Generates strikes around ATM and fetches quotes.
+        """
+        if not self.fyers_manager:
+            print("⚠️ Fyers Manager not available in RealMarketData. Falling back to NSE Scraping (Deprecated).")
+            return self._get_nse_option_chain_fallback(symbol, expiry_date)
+
+        try:
+            # 1. Get Spot Price
+            spot_price = self.fyers_manager.get_index_spot(symbol)
+            if spot_price == 0:
+                raise Exception(f"Failed to fetch spot price for {symbol}")
+            
+            # 2. Calculate ATM Strike
+            atm_strike = round(spot_price / 100) * 100
+            
+            # 3. Generate Strikes (ATM +/- 10)
+            strikes = []
+            for i in range(-10, 11):
+                strikes.append(atm_strike + (i * 100))
+                
+            # 4. Generate Symbols
+            # Parse expiry date
+            expiry_dt = datetime.strptime(expiry_date, "%d-%b-%Y").date()
+            
+            # Determine if Weekly or Monthly logic needed
+            fyers_symbols = []
+            strike_map = {} # Map symbol -> (strike, type)
+            
+            underlying = "BANKNIFTY" if symbol == "BANKNIFTY" else "NIFTY"
+            
+            # --- IMPROVED MONTHLY CHECK ---
+            # BankNifty expires on Last Tuesday (usually)
+            # Nifty expires on Last Thursday (usually)
+            # To be safe, we check if the date is in the last week of the month.
+            # If (total_days_in_month - expiry_day) < 7, it is the last occurrence of that weekday.
+            # And usually, the Monthly contract is the last expiry of the month.
+            
+            import calendar
+            last_day_of_month = calendar.monthrange(expiry_dt.year, expiry_dt.month)[1]
+            is_last_week = (last_day_of_month - expiry_dt.day) < 7
+            
+            # If it's the last week, we assume it's the Monthly contract.
+            # Exception: If there's a holiday and expiry moves, it's still the "Monthly" contract.
+            # Fyers uses 'MMM' (e.g. DEC) for Monthly, and 'M'+'DD' (e.g. D30) for Weekly.
+            # However, Fyers treats the "Monthly" contract as the one expiring at the end of the month.
+            
+            is_monthly = is_last_week
+            
+            for strike in strikes:
+                # CE
+                if is_monthly:
+                    ce_sym = self.fyers_manager._get_monthly_contract_symbol(underlying, expiry_dt, strike, "CE")
+                    pe_sym = self.fyers_manager._get_monthly_contract_symbol(underlying, expiry_dt, strike, "PE")
+                else:
+                    ce_sym = self.fyers_manager._get_weekly_contract_symbol(underlying, expiry_dt, strike, "CE")
+                    pe_sym = self.fyers_manager._get_weekly_contract_symbol(underlying, expiry_dt, strike, "PE")
+                
+                fyers_symbols.append(ce_sym)
+                fyers_symbols.append(pe_sym)
+                strike_map[ce_sym] = {"strike": strike, "type": "CE"}
+                strike_map[pe_sym] = {"strike": strike, "type": "PE"}
+                
+            # 5. Fetch Quotes
+            quotes = self.fyers_manager.get_quotes(fyers_symbols)
+            
+            # --- RETRY LOGIC FOR SYMBOL FORMAT ---
+            # If quotes are empty (all 0), it might be that we guessed the format wrong.
+            # E.g., maybe it IS the last week but Fyers treats it as Weekly (unlikely) or vice versa.
+            # Or maybe we calculated 'is_monthly' wrong.
+            # Let's check if we got valid data.
+            
+            valid_data_count = sum(1 for d in quotes.values() if d.get('lp', 0) > 0)
+            
+            if valid_data_count == 0 and len(quotes) > 0:
+                print(f"⚠️ No data found for generated symbols (is_monthly={is_monthly}). Retrying with opposite format...")
+                # Flip is_monthly and try again
+                is_monthly = not is_monthly
+                fyers_symbols = []
+                strike_map = {}
+                
+                for strike in strikes:
+                    if is_monthly:
+                        ce_sym = self.fyers_manager._get_monthly_contract_symbol(underlying, expiry_dt, strike, "CE")
+                        pe_sym = self.fyers_manager._get_monthly_contract_symbol(underlying, expiry_dt, strike, "PE")
+                    else:
+                        ce_sym = self.fyers_manager._get_weekly_contract_symbol(underlying, expiry_dt, strike, "CE")
+                        pe_sym = self.fyers_manager._get_weekly_contract_symbol(underlying, expiry_dt, strike, "PE")
+                    
+                    fyers_symbols.append(ce_sym)
+                    fyers_symbols.append(pe_sym)
+                    strike_map[ce_sym] = {"strike": strike, "type": "CE"}
+                    strike_map[pe_sym] = {"strike": strike, "type": "PE"}
+                
+                quotes = self.fyers_manager.get_quotes(fyers_symbols)
+            
+            # 6. Format Data
+            option_chain = []
+            for sym, data in quotes.items():
+                meta = strike_map.get(sym)
+                if not meta: continue
+                
+                option_chain.append({
+                    "tradingsymbol": sym, # Use Fyers Symbol
+                    "strike": float(meta['strike']),
+                    "type": meta['type'],
+                    "expiry": expiry_date,
+                    "ltp": float(data.get('lp', 0)),
+                    "oi": float(data.get('oi', 0)),
+                    "volume": float(data.get('volume', 0)),
+                    "iv": 0.0, # Fyers Quote might not have IV directly? 'cmd' might have it? 'lp' is LTP.
+                    # Fyers Quote keys: 'lp'=LTP, 'oi'=OpenInterest, 'v'=Volume, 'bp'=Bid, 'ap'=Ask
+                    # IV is not usually in standard quote. We might have to live without IV or calculate it?
+                    # For now, set IV to 0.
+                    "bid": float(data.get('bp', 0)),
+                    "ask": float(data.get('ap', 0))
+                })
+                
+            return option_chain
+
+        except Exception as e:
+            print(f"❌ Fyers Option Chain failed: {e}. Trying fallback...")
+            return self._get_nse_option_chain_fallback(symbol, expiry_date)
+
+    def _get_nse_option_chain_fallback(self, symbol: str, expiry_date: str) -> List[Dict[str, Any]]:
+        """Original NSE Scraping Logic (Moved here as fallback)"""
         try:
             data = self._fetch_nse_option_data(symbol)
             option_chain = []
@@ -231,7 +387,8 @@ class RealMarketData:
                 raise Exception(f"No option data found for expiry {expiry_date}.")
             return option_chain
         except Exception as e:
-            raise Exception(f"Failed to parse NSE option chain: {e}")
+            print(f"Fallback NSE failed: {e}")
+            return []
 
     def get_candle_data(self, symbol: str = "^NSEBANK") -> Dict[str, Any]:
         # ... (no change) ...

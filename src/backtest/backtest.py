@@ -58,31 +58,41 @@ class MultiTimeframeStrategy(StrategyTemplate):
         )
         self.parameters = {
             'ema_short': 9, 'ema_long': 15,
-            'atr_period': 14, 'adx_period': 14, 'rsi_period': 5,
+            'atr_period': 10, 'adx_period': 14, 'rsi_period': 15,
             
             # Filters (Enabled by Default)
             'use_adx_filter': False, 'adx_threshold': 20,
-            'use_rsi_filter': True, 'rsi_overbought': 70, 'rsi_oversold': 30,
+            'use_rsi_filter': True, 'rsi_overbought': 77, 'rsi_oversold': 25,
+            'use_1h_filter': False, 
+            'use_15m_filter': True, # --- NEW: Optional 15m Filter ---
+            'use_30m_filter': False, # --- NEW: Optional 30m Filter ---
             
             # --- NEW: Expiry Filter ---
-            'skip_last_week_expiry': True,
+            'skip_last_week_expiry': False,
             
             # --- NEW: Candle Size Filter ---
             'use_candle_size_filter': True,
             'candle_size_period': 10,
             'candle_size_factor': 1.0,
             
+            # --- NEW: EMA Ribbon Filter ---
+            'use_ema_ribbon': False,
+            'ema_ribbon_periods': [20, 50, 100, 200],
+            
             # Risk params
             'lot_size': 35, 'min_investment': 10000, 
             'max_daily_loss': 2000, 'max_trades_per_day': 10,
-            'trade_start_time': time(9, 30), 'trade_end_time': time(14, 0),
+            'trade_start_time': time(9, 30), 'trade_end_time': time(15, 0),
+            'max_trade_duration_minutes': 120,
+            'use_dynamic_risk': True,
+            'use_trailing_sl': False,
             
             # SL/TP
             'sl_mode': 'ATR', 'invested_value_sl_pct': 5.0, 'tp_sl_ratio': 2.0,
-            'atr_tp_multiplier': 4.0, 'atr_sl_multiplier': 1.4,
+            'atr_tp_multiplier': 4.3, 'atr_sl_multiplier': 1.4,
             
             # Sim params
-            'simulated_premium_pct': 0.008, 'simulated_delta': 0.5,
+            'simulated_premium_pct': 0.008, 'simulated_delta': 0.7,
         }
         self.IST = ZoneInfo('Asia/Kolkata')
         self.current_day = None
@@ -102,50 +112,78 @@ class MultiTimeframeStrategy(StrategyTemplate):
 
     def _is_last_week_of_expiry(self, current_dt: datetime) -> bool:
         """
-        Checks if the date is within the restricted period before expiry.
-        - Monthly Expiry: Skip last 7 days (Thu-Wed).
-        - Weekly Expiry: Skip last 2 days (Tue-Wed).
+        Checks if the date is a 'Volatile Day' (Monday or Tuesday) of the expiry week.
+        User specified: "volatility days are monday and tuesday for weekly and monthly because bank nifty and nifty 50 expires on tuesday"
         """
         current_date = current_dt.date()
+        weekday = current_date.weekday() # Mon=0, Tue=1, Wed=2...
         
-        # 1. Find the next Wednesday (Expiry)
-        # If today is Wed (2), days_ahead=0. If Thu (3), days_ahead=6.
-        days_ahead = (2 - current_date.weekday() + 7) % 7
-        next_expiry = current_date + timedelta(days=days_ahead)
+        # If today is Monday (0) or Tuesday (1), it's considered volatile based on user rule.
+        # We assume the user wants to skip trading on these days regardless of whether it's strictly "expiry week" or not,
+        # OR we can try to be smart about "expiry week".
+        # Given the prompt "volatility days are monday and tuesday... because... expires on tuesday",
+        # it implies EVERY Monday and Tuesday are volatile if we assume weekly expiries happen every Tuesday.
         
-        # 2. Check if it's a Monthly Expiry
-        last_wed_of_month = self._get_last_wednesday(next_expiry.year, next_expiry.month)
-        is_monthly = (next_expiry == last_wed_of_month)
+        # However, to be safe and stick to "expiry" logic:
+        # If expiry is Tuesday, then Monday (1 day before) and Tuesday (0 days before) are the days.
         
-        if is_monthly:
-            # Monthly Rule: Skip last 7 days (Thu before to Wed of expiry)
-            # This means if we are within 6 days of expiry (Thu=6, Fri=5... Wed=0)
-            return days_ahead <= 6
-        else:
-            # Weekly Rule: Skip last 2 days (Tue & Wed)
-            # Tue=1, Wed=0
-            return days_ahead <= 1
+        # Let's implement the strict "Monday and Tuesday" check for now as requested.
+        if weekday == 0 or weekday == 1:
+            return True
+            
+        return False
 
     def prepare_data(self, engine: 'BacktestEngine', symbol: str, start_date: datetime, end_date: datetime, interval: str, **kwargs) -> pd.DataFrame:
         """
         Fetches 5m, 15m, and 1h data separately and merges them.
+        Supports 'prefetched_data' in kwargs to avoid re-fetching during optimization.
         """
-        print(f"[DEBUG] MTA Strategy prepare_data called for {symbol} with interval {interval}")
+        # print(f"[DEBUG] MTA Strategy prepare_data called for {symbol} with interval {interval}")
+        
+        prefetched_data = kwargs.get('prefetched_data')
+        
         # 1. Fetch Base Data (5m) - Force 5m interval
         if interval != "5":
-            print(f"Warning: MTA Strategy requires 5m base interval. Overriding {interval} to 5.")
+            # print(f"Warning: MTA Strategy requires 5m base interval. Overriding {interval} to 5.")
             interval = "5"
             
-        df_5m = engine.data_manager.get_historical_index_data(symbol, start_date, end_date, "5", is_backtest_log=True)
+        df_5m = None
+        if prefetched_data and '5m' in prefetched_data:
+             df_5m = prefetched_data['5m'].copy()
+        else:
+             df_5m = engine.data_manager.get_historical_index_data(symbol, start_date, end_date, "5", is_backtest_log=True)
+             
         if df_5m is None or df_5m.empty: return None
         
-        # 2. Fetch 15m Data
-        df_15m = engine.data_manager.get_historical_index_data(symbol, start_date, end_date, "15", is_backtest_log=True)
+        # 2. Fetch 15m Data (Optional)
+        use_15m = kwargs.get('use_15m_filter', self.parameters.get('use_15m_filter', True))
+        df_15m = None
+        if use_15m:
+            if prefetched_data and '15m' in prefetched_data:
+                df_15m = prefetched_data['15m'].copy()
+            else:
+                df_15m = engine.data_manager.get_historical_index_data(symbol, start_date, end_date, "15", is_backtest_log=True)
         
-        # 3. Fetch 1h Data
-        df_1h = engine.data_manager.get_historical_index_data(symbol, start_date, end_date, "60", is_backtest_log=True)
+        # 3. Fetch 1h Data (Optional)
+        use_1h = kwargs.get('use_1h_filter', self.parameters.get('use_1h_filter', True))
+        df_1h = None
+        if use_1h:
+            if prefetched_data and '1h' in prefetched_data:
+                df_1h = prefetched_data['1h'].copy()
+            else:
+                df_1h = engine.data_manager.get_historical_index_data(symbol, start_date, end_date, "60", is_backtest_log=True)
+
+        # 4. Fetch 30m Data (Optional)
+        use_30m = kwargs.get('use_30m_filter', self.parameters.get('use_30m_filter', False))
+        df_30m = None
+        if use_30m:
+            if prefetched_data and '30m' in prefetched_data:
+                df_30m = prefetched_data['30m'].copy()
+            else:
+                # print(f"[DEBUG] Fetching 30m data for {symbol}...")
+                df_30m = engine.data_manager.get_historical_index_data(symbol, start_date, end_date, "30", is_backtest_log=True)
         
-        # 4. Calculate Indicators on Higher Timeframes BEFORE merging
+        # 5. Calculate Indicators on Higher Timeframes BEFORE merging
         # This is crucial because merging first would mess up the rolling calculations
         ema_short = kwargs.get('ema_short', 9)
         ema_long = kwargs.get('ema_long', 15)
@@ -157,19 +195,31 @@ class MultiTimeframeStrategy(StrategyTemplate):
         if df_1h is not None and not df_1h.empty:
             df_1h['ema_short_1h'] = df_1h['close'].ewm(span=ema_short, adjust=False).mean()
             df_1h['ema_long_1h'] = df_1h['close'].ewm(span=ema_long, adjust=False).mean()
+
+        if df_30m is not None and not df_30m.empty:
+            df_30m['ema_short_30m'] = df_30m['close'].ewm(span=ema_short, adjust=False).mean()
+            df_30m['ema_long_30m'] = df_30m['close'].ewm(span=ema_long, adjust=False).mean()
             
-        # 5. Merge Higher Timeframes to Base (5m)
-        # We align by timestamp. 15m/1h data will be sparse on the 5m index.
-        # We use ffill() to propagate the last known 15m/1h value forward.
+        # 6. Merge Higher Timeframes to Base (5m)
+        # We align by timestamp. 15m/1h/30m data will be sparse on the 5m index.
+        # We use ffill() to propagate the last known value forward.
         
         df_5m['15m_timestamp'] = df_5m.index.floor('15min')
         df_5m = pd.merge(df_5m, df_15m[['ema_short_15m', 'ema_long_15m']], left_on='15m_timestamp', right_index=True, how='left')
         
         # Fix for 1h candles starting at 09:15 (NSE Market Hours)
-        # Logic: Shift back 15m -> floor to hour -> shift forward 15m
-        # e.g. 09:20 -> 09:05 -> 09:00 -> 09:15
-        df_5m['1h_timestamp'] = (df_5m.index - pd.Timedelta(minutes=15)).floor('1h') + pd.Timedelta(minutes=15)
-        df_5m = pd.merge(df_5m, df_1h[['ema_short_1h', 'ema_long_1h']], left_on='1h_timestamp', right_index=True, how='left')
+        if df_1h is not None:
+            df_5m['1h_timestamp'] = (df_5m.index - pd.Timedelta(minutes=15)).floor('1h') + pd.Timedelta(minutes=15)
+            df_5m = pd.merge(df_5m, df_1h[['ema_short_1h', 'ema_long_1h']], left_on='1h_timestamp', right_index=True, how='left')
+
+        # Fix for 30m candles starting at 09:15
+        if df_30m is not None:
+            # 30m candles: 09:15, 09:45, 10:15...
+            # Floor 30m logic:
+            # 09:20 -> 09:15. 09:40 -> 09:15. 09:50 -> 09:45.
+            # (Time - 15m).floor(30m) + 15m
+            df_5m['30m_timestamp'] = (df_5m.index - pd.Timedelta(minutes=15)).floor('30min') + pd.Timedelta(minutes=15)
+            df_5m = pd.merge(df_5m, df_30m[['ema_short_30m', 'ema_long_30m']], left_on='30m_timestamp', right_index=True, how='left')
         
         # Forward fill to propagate signals
         df_5m.ffill(inplace=True)
@@ -220,6 +270,14 @@ class MultiTimeframeStrategy(StrategyTemplate):
             df['candle_range'] = df['high'] - df['low']
             df['avg_candle_range'] = df['candle_range'].rolling(window=candle_size_period).mean()
 
+            # --- NEW: EMA Ribbon Indicators ---
+            # We calculate these on the base timeframe (5m) as requested "on the chart" usually implies the trading chart.
+            # If the user meant higher timeframe ribbon, we can adjust, but usually it's the entry chart.
+            ema_ribbon_periods = kwargs.get('ema_ribbon_periods', [20, 50, 100, 200])
+            for period in ema_ribbon_periods:
+                col_name = f'ema_ribbon_{period}'
+                df[col_name] = df['close'].ewm(span=period, adjust=False).mean()
+
             # Note: Higher timeframe indicators (ema_short_15m, etc.) are already present 
             # because they were added in prepare_data. We just need to ensure they exist.
             required_cols = ['ema_short_15m', 'ema_long_15m', 'ema_short_1h', 'ema_long_1h']
@@ -269,12 +327,17 @@ class MultiTimeframeStrategy(StrategyTemplate):
         use_candle_size_filter = kwargs.get('use_candle_size_filter', self.parameters['use_candle_size_filter'])
         candle_size_factor = kwargs.get('candle_size_factor', self.parameters['candle_size_factor'])
         
+        # --- NEW: EMA Ribbon Params ---
+        use_ema_ribbon = kwargs.get('use_ema_ribbon', self.parameters.get('use_ema_ribbon', False))
+        ema_ribbon_periods = kwargs.get('ema_ribbon_periods', [20, 50, 100, 200])
+        
         min_periods = max(
             self.parameters['ema_long'], 
             kwargs.get('atr_period', 14),
             kwargs.get('adx_period', 14),
             kwargs.get('rsi_period', 14),
-            kwargs.get('candle_size_period', 20)
+            kwargs.get('candle_size_period', 20),
+            max(ema_ribbon_periods) if use_ema_ribbon else 0
         ) + 1
         
         if min_periods >= len(df_5m):
@@ -290,7 +353,13 @@ class MultiTimeframeStrategy(StrategyTemplate):
                 if self._is_last_week_of_expiry(current_dt):
                     continue # Skip signal generation for this candle
             
-            if pd.isna(current['ema_short']) or pd.isna(current['ema_short_15m']) or pd.isna(current['ema_short_1h']) or pd.isna(prev['ema_short']):
+            # --- NEW: 1H Filter Logic ---
+            use_1h_filter = kwargs.get('use_1h_filter', self.parameters.get('use_1h_filter', True))
+
+            if pd.isna(current['ema_short']) or pd.isna(current['ema_short_15m']) or pd.isna(prev['ema_short']):
+                continue
+                
+            if use_1h_filter and pd.isna(current['ema_short_1h']):
                 continue
             
             # --- NEW: ADX Trend Strength Filter ---
@@ -302,6 +371,35 @@ class MultiTimeframeStrategy(StrategyTemplate):
             if use_candle_size_filter:
                 if pd.isna(current['avg_candle_range']) or current['candle_range'] < (current['avg_candle_range'] * candle_size_factor):
                     continue # Candle is too small, skip signal
+            
+            # --- NEW: EMA Ribbon Filter ---
+            is_ribbon_uptrend = True
+            is_ribbon_downtrend = True
+            
+            if use_ema_ribbon:
+                # Logic: 20 > 50 > 100 > 200
+                # We assume periods are sorted [20, 50, 100, 200]
+                # If not, we should sort them, but let's assume default.
+                # Actually, let's be robust.
+                sorted_periods = sorted(ema_ribbon_periods)
+                
+                # Check Uptrend: Price > EMA1 > EMA2 > EMA3...
+                # Or just EMA1 > EMA2 > EMA3...
+                # Strict Ribbon: All EMAs aligned.
+                
+                vals = [current[f'ema_ribbon_{p}'] for p in sorted_periods]
+                
+                # Check if any are NaN
+                if any(pd.isna(v) for v in vals):
+                    is_ribbon_uptrend = False
+                    is_ribbon_downtrend = False
+                else:
+                    # Uptrend: v[0] > v[1] > v[2] ...
+                    is_ribbon_uptrend = all(vals[i] > vals[i+1] for i in range(len(vals)-1))
+                    # Downtrend: v[0] < v[1] < v[2] ...
+                    is_ribbon_downtrend = all(vals[i] < vals[i+1] for i in range(len(vals)-1))
+                    
+                    # Optional: Price check? Usually Price > Shortest EMA is implied by crossover strategy
             
             # Trend conditions
             is_1h_uptrend = current['ema_short_1h'] > current['ema_long_1h']
@@ -317,8 +415,42 @@ class MultiTimeframeStrategy(StrategyTemplate):
             
             strike = int(round(current['close'] / 100.0) * 100)
 
-            # BUY Signal (All timeframes aligned)
-            if is_5m_bullish_cross and is_15m_uptrend and is_1h_uptrend:
+            # --- NEW: Flexible Timeframe Filter Logic ---
+            use_15m_filter = kwargs.get('use_15m_filter', self.parameters.get('use_15m_filter', True))
+            use_30m_filter = kwargs.get('use_30m_filter', self.parameters.get('use_30m_filter', False))
+            use_1h_filter = kwargs.get('use_1h_filter', self.parameters.get('use_1h_filter', True))
+            
+            # Check alignment for each enabled timeframe
+            aligned_up = True
+            aligned_down = True
+            
+            if use_15m_filter:
+                aligned_up &= is_15m_uptrend
+                aligned_down &= is_15m_downtrend
+                
+            if use_30m_filter:
+                if 'ema_short_30m' in current and not pd.isna(current['ema_short_30m']):
+                    is_30m_uptrend = current['ema_short_30m'] > current['ema_long_30m']
+                    is_30m_downtrend = current['ema_short_30m'] < current['ema_long_30m']
+                    aligned_up &= is_30m_uptrend
+                    aligned_down &= is_30m_downtrend
+                else:
+                    # If data missing but filter enabled, what to do? 
+                    # For safety, maybe fail? Or ignore? 
+                    # Let's assume if data missing, we can't confirm trend.
+                    aligned_up = False
+                    aligned_down = False
+
+            if use_1h_filter:
+                aligned_up &= is_1h_uptrend
+                aligned_down &= is_1h_downtrend
+
+            # BUY Signal (All enabled timeframes aligned)
+            if is_5m_bullish_cross and aligned_up:
+                # --- NEW: EMA Ribbon Check ---
+                if use_ema_ribbon and not is_ribbon_uptrend:
+                    continue
+
                 # --- NEW: RSI Overbought Filter ---
                 if use_rsi_filter:
                     if not pd.isna(current['rsi']) and current['rsi'] > rsi_overbought:
@@ -334,8 +466,12 @@ class MultiTimeframeStrategy(StrategyTemplate):
                 df_5m.loc[df_5m.index[i], 'strike'] = strike
                 df_5m.loc[df_5m.index[i], 'opt_type'] = "CE"
             
-            # SELL Signal (All timeframes aligned)
-            elif is_5m_bearish_cross and is_15m_downtrend and is_1h_downtrend:
+            # SELL Signal (All enabled timeframes aligned)
+            elif is_5m_bearish_cross and aligned_down:
+                # --- NEW: EMA Ribbon Check ---
+                if use_ema_ribbon and not is_ribbon_downtrend:
+                    continue
+
                 # --- NEW: RSI Oversold Filter ---
                 if use_rsi_filter:
                     if not pd.isna(current['rsi']) and current['rsi'] < rsi_oversold:
@@ -377,7 +513,10 @@ class MultiTimeframeStrategy(StrategyTemplate):
         # --- NEW: Ensure we use the LAST COMPLETED candle ---
         # If the last candle in the dataframe is still forming (based on time), we use the one before it.
         last_candle_time = df_5m.index[-1]
-        now = datetime.now(self.IST)
+        now = datetime.now(self.IST).replace(tzinfo=None)
+        
+        # DEBUG: Check Timezones
+        # print(f"[DEBUG] Last Candle: {last_candle_time} (tz={last_candle_time.tzinfo}), Now: {now} (tz={now.tzinfo})")
         
         # Assuming 5m candles. If current time is before candle_start + 5m, it's forming.
         # We add a small buffer (e.g. 1 sec) to be safe.
@@ -428,6 +567,28 @@ class MultiTimeframeStrategy(StrategyTemplate):
             if pd.isna(current['adx']) or current['adx'] < adx_threshold:
                 # print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping signal check: ADX ({current['adx']:.1f}) is below threshold ({adx_threshold})")
                 return None
+        
+        # --- NEW: EMA Ribbon Filter (Live) ---
+        use_ema_ribbon = params.get('use_ema_ribbon', False)
+        is_ribbon_uptrend = True
+        is_ribbon_downtrend = True
+        
+        if use_ema_ribbon:
+            ema_ribbon_periods = params.get('ema_ribbon_periods', [20, 50, 100, 200])
+            sorted_periods = sorted(ema_ribbon_periods)
+            vals = []
+            has_nan = False
+            for p in sorted_periods:
+                col = f'ema_ribbon_{p}'
+                if col not in current or pd.isna(current[col]):
+                    has_nan = True; break
+                vals.append(current[col])
+            
+            if has_nan:
+                is_ribbon_uptrend = False; is_ribbon_downtrend = False
+            else:
+                is_ribbon_uptrend = all(vals[i] > vals[i+1] for i in range(len(vals)-1))
+                is_ribbon_downtrend = all(vals[i] < vals[i+1] for i in range(len(vals)-1))
             
         if self.daily_trend == 'NEUTRAL':
             is_15m_uptrend = current['ema_short_15m'] > current['ema_long_15m']
@@ -448,7 +609,41 @@ class MultiTimeframeStrategy(StrategyTemplate):
         
         signal_to_fire = None
         
-        if is_5m_bullish_cross and is_5m_uptrend and is_15m_uptrend and is_1h_uptrend:
+        # --- NEW: Flexible Timeframe Filter Logic (Live) ---
+        use_15m_filter = params.get('use_15m_filter', True)
+        use_30m_filter = params.get('use_30m_filter', False)
+        use_1h_filter = params.get('use_1h_filter', True)
+        
+        aligned_up = True
+        aligned_down = True
+        
+        if use_15m_filter:
+            aligned_up &= is_15m_uptrend
+            aligned_down &= is_15m_downtrend
+            
+        if use_1h_filter:
+            aligned_up &= is_1h_uptrend
+            aligned_down &= is_1h_downtrend
+            
+        # 30M check (Live data should have it if fetched correctly)
+        if use_30m_filter:
+             # Check if 30m columns exist
+            if 'ema_short_30m' in current and not pd.isna(current['ema_short_30m']):
+                is_30m_uptrend = current['ema_short_30m'] > current['ema_long_30m']
+                is_30m_downtrend = current['ema_short_30m'] < current['ema_long_30m']
+                aligned_up &= is_30m_uptrend
+                aligned_down &= is_30m_downtrend
+            else:
+                # If 30m data missing in live but required, be conservative
+                aligned_up = False
+                aligned_down = False
+
+        if is_5m_bullish_cross and is_5m_uptrend and aligned_up:
+            # --- NEW: EMA Ribbon Check ---
+            if use_ema_ribbon and not is_ribbon_uptrend:
+                # print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping BUY: EMA Ribbon not aligned UP")
+                return None
+
             # --- NEW: RSI Overbought Filter ---
             if use_rsi_filter and not pd.isna(current['rsi']) and current['rsi'] > rsi_overbought:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping BUY signal: RSI ({current['rsi']:.1f}) is Overbought (>{rsi_overbought})")
@@ -460,7 +655,12 @@ class MultiTimeframeStrategy(StrategyTemplate):
                               "atr": current['atr'], "adx": current['adx'],
                               "timestamp": current.name}
                               
-        elif is_5m_bearish_cross and is_5m_downtrend and is_15m_downtrend and is_1h_downtrend:
+        elif is_5m_bearish_cross and is_5m_downtrend and aligned_down:
+            # --- NEW: EMA Ribbon Check ---
+            if use_ema_ribbon and not is_ribbon_downtrend:
+                # print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping SELL: EMA Ribbon not aligned DOWN")
+                return None
+
             # --- NEW: RSI Oversold Filter ---
             if use_rsi_filter and not pd.isna(current['rsi']) and current['rsi'] < rsi_oversold:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Skipping SELL signal: RSI ({current['rsi']:.1f}) is Oversold (<{rsi_oversold})")
@@ -576,8 +776,7 @@ class BacktestEngine:
     def __init__(self, initial_capital: float = 100000, fyers_manager: 'FyersDataManager' = None):
         self.initial_capital = initial_capital 
         self.strategies = {}
-        if fyers_manager is None:
-            raise ValueError("BacktestEngine requires a FyersDataManager instance.")
+        # fyers_manager can be None for offline/parallel mode
         self.data_manager = fyers_manager
         self.register_builtin_strategies()
 
@@ -682,6 +881,14 @@ class BacktestEngine:
         sim_premium_pct = params.get('simulated_premium_pct', 0.008)
         sim_delta = params.get('simulated_delta', 0.5) # 0.5 Delta
         
+        # --- NEW: Max Trade Duration ---
+        max_trade_duration_minutes = params.get('max_trade_duration_minutes', 30)
+        if not silent: print(f"[DEBUG] Max Trade Duration: {max_trade_duration_minutes} mins")
+        
+        # --- NEW: Trailing Stop Loss ---
+        use_trailing_sl = params.get('use_trailing_sl', False)
+        trailing_sl_multiplier = params.get('trailing_sl_multiplier', 1.5)
+        
         if sl_mode == "ATR" and 'atr' not in data.columns:
             if not silent: st.error(f"ATR column missing for simulated trade. Backtest failed."); 
             raise ValueError("ATR column missing")
@@ -714,31 +921,60 @@ class BacktestEngine:
                 premium_points_diff = index_points_diff * sim_delta
                 current_premium_price = max(0.05, entry_price + premium_points_diff)
                 
+                # --- NEW: Trailing Stop Loss Logic ---
+                if use_trailing_sl:
+                    # Update max premium price seen during trade
+                    current_trade['max_premium_price'] = max(current_trade.get('max_premium_price', entry_price), current_premium_price)
+                    
+                    # Calculate Trailing SL
+                    # Using ATR-based trailing: SL = Max Price - (ATR * Multiplier * Delta)
+                    current_atr = row['atr']
+                    trailing_sl_dist = current_atr * trailing_sl_multiplier * sim_delta
+                    new_sl_price = current_trade['max_premium_price'] - trailing_sl_dist
+                    
+                    # Only move SL UP
+                    if new_sl_price > stop_loss_price:
+                        stop_loss_price = new_sl_price
+                        current_trade['stop_loss_price'] = stop_loss_price # Update in trade record
+                
                 stop_loss_trigger, take_profit_trigger = False, False
                 if current_premium_price <= stop_loss_price: stop_loss_trigger = True
                 if current_premium_price >= take_profit_price: take_profit_trigger = True
                 
-                if stop_loss_trigger or take_profit_trigger or is_eod_exit:
+                # Check Time Exit (Moved outside)
+                current_duration = (timestamp - current_trade['entry_time']).total_seconds() / 60
+                is_time_exit = current_duration >= max_trade_duration_minutes
+                
+                if stop_loss_trigger or take_profit_trigger or is_eod_exit or is_time_exit:
                     exit_price = current_premium_price
                     exit_index_price = current_index_price
                     if stop_loss_trigger: exit_price = stop_loss_price
                     if take_profit_trigger: exit_price = take_profit_price
                     
-                    pnl = (exit_price - entry_price) * lot_size
-                    today_realized_pnl += pnl 
-                    invested_amount = current_trade.get('invested_amount', 1)
-                    return_pct = (pnl / invested_amount) * 100 if invested_amount else 0
-                    exit_reason = 'EOD_SQUARE_OFF' if is_eod_exit else ('STOP_LOSS' if stop_loss_trigger else 'TAKE_PROFIT')
+                    # If time exit and no other trigger, exit at current price
+                    if is_time_exit and not (stop_loss_trigger or take_profit_trigger or is_eod_exit):
+                         exit_price = current_premium_price
                     
-                    current_trade.update({
-                        'exit_time': timestamp, 'exit_price': exit_price, 'pnl': pnl, 
-                        'return_pct': return_pct, 'exit_reason': exit_reason, 
-                        'trade_duration': (timestamp - current_trade['entry_time']).total_seconds() / 60,
-                        'exit_index_price': exit_index_price
-                    })
-                    trades.append(current_trade)
-                    capital += pnl
-                    trade_active = False; position_type = None
+                    # Combine triggers (Redundant check but keeps structure)
+                    if True:
+                        pnl = (exit_price - entry_price) * lot_size
+                        today_realized_pnl += pnl 
+                        invested_amount = current_trade.get('invested_amount', 1)
+                        return_pct = (pnl / invested_amount) * 100 if invested_amount else 0
+                        
+                        exit_reason = 'EOD_SQUARE_OFF' if is_eod_exit else \
+                                      ('TIME_EXIT' if is_time_exit else \
+                                      ('STOP_LOSS' if stop_loss_trigger else 'TAKE_PROFIT'))
+                        
+                        current_trade.update({
+                            'exit_time': timestamp, 'exit_price': exit_price, 'pnl': pnl, 
+                            'return_pct': return_pct, 'exit_reason': exit_reason, 
+                            'trade_duration': (timestamp - current_trade['entry_time']).total_seconds() / 60,
+                            'exit_index_price': exit_index_price
+                        })
+                        trades.append(current_trade)
+                        capital += pnl
+                        trade_active = False; position_type = None
             
             # --- 2. Check for New Trade Entry ---
             if not trade_active and row['signal'] != 0 and not is_eod_exit:
