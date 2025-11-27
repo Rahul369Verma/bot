@@ -447,8 +447,24 @@ class AngelClient:
             strike = signal.get("strike")
             option_type = signal.get("type")
             expiry_dt = datetime.strptime(expiry, "%d-%b-%Y") 
-            expiry_str = expiry_dt.strftime("%d%b%y").upper()
-            tradingsymbol = f"{self.index_name}{expiry_str}{strike}{option_type}"
+            
+            # --- MODIFIED: Lookup Symbol from Chain (Avoid Manual Construction) ---
+            # Fetch chain to get correct Fyers symbol
+            chain = self.get_option_chain(expiry=expiry)
+            found_option = None
+            for item in chain:
+                if item['strike'] == strike and item['type'] == option_type:
+                    found_option = item
+                    break
+            
+            if not found_option:
+                # Fallback to manual construction if not found (unlikely)
+                expiry_str = expiry_dt.strftime("%d%b%y").upper()
+                tradingsymbol = f"{self.index_name}{expiry_str}{strike}{option_type}"
+                print(f"⚠️ Option not found in chain. Constructed fallback: {tradingsymbol}")
+            else:
+                tradingsymbol = found_option['tradingsymbol']
+                
             option_ltp = self.get_option_ltp(tradingsymbol, expiry_hint=expiry)
             cost_of_one_lot = option_ltp * self.lot_size
             if cost_of_one_lot < self.min_investment:
