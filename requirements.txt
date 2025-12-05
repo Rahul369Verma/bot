@@ -11,3 +11,4 @@ fyers-apiv3
 requests
 kiteconnect
 yfinance
+setuptools
