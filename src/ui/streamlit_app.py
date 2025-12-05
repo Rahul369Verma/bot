@@ -78,7 +78,7 @@ strategy_name_map = {
     'mta_ema_crossover': "MTA Crossover (EMA)"
 }
 
-fyers_manager = init_fyers_manager()
+fyers_manager = init_fyers_manager(version=2)
 
 # --- Fyers Login Flow ---
 # Check for auth_code in URL (callback from Fyers)

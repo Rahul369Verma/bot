@@ -46,7 +46,7 @@ def highlight_atm(row, atm_strike):
 # Initialization Functions
 # ---------------------------
 @st.cache_resource
-def init_fyers_manager():
+def init_fyers_manager(version=1):
     """Initializes the Fyers Data Manager (Cached)."""
     try:
         return FyersDataManager()

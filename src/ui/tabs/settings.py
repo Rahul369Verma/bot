@@ -44,6 +44,28 @@ def render_settings_tab(fyers_manager):
                     else:
                         st.error("❌ Failed to reload token. The token file may be missing or invalid.")
             
+            # --- NEW: Delete Token Button ---
+            st.divider()
+            st.subheader("🗑️ Delete Token")
+            st.warning("Deleting the token will require you to re-authenticate with Fyers.")
+            if st.button("🗑️ Delete Token & Logout", type="primary", width='stretch'):
+                if fyers_manager.delete_token():
+                    # Signal bot to stop
+                    if 'bot_stop_event' in st.session_state:
+                        st.session_state.bot_stop_event.set()
+                        time.sleep(1)
+                    
+                    # Clear session state
+                    for key in list(st.session_state.keys()):
+                        del st.session_state[key]
+                        
+                    st.cache_resource.clear()
+                    st.success("✅ Token deleted. Reloading...")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to delete token.")
+            
             # --- NEW: Telegram Notification Test ---
             st.divider()
             st.subheader("📱 Telegram Notifications")

@@ -214,6 +214,29 @@ class FyersDataManager:
             print("❌ Token reload failed - token is invalid or expired.")
             return False
 
+    def delete_token(self) -> bool:
+        """
+        Deletes the stored token file and clears the current session.
+        Returns True if successful, False otherwise.
+        """
+        print("🗑️ Deleting Fyers token...")
+        try:
+            if os.path.exists(TOKEN_FILE):
+                os.remove(TOKEN_FILE)
+                print(f"✅ Deleted token file: {TOKEN_FILE}")
+            else:
+                print("⚠️ Token file not found.")
+            
+            # Reset internal state
+            self.access_token = None
+            self.fyers = None
+            self._auth_cache = None
+            self._auth_cache_time = 0
+            return True
+        except Exception as e:
+            print(f"❌ Error deleting token file: {e}")
+            return False
+
     def get_historical_index_data(self, index_name: str, start_date: datetime, end_date: datetime, 
                                   interval: str = "1", is_backtest_log: bool = False) -> pd.DataFrame:
         """Fetches historical data for an INDEX."""
