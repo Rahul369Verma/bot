@@ -79,7 +79,8 @@ class FyersDataManager:
                     token=self.access_token,
                     log_path=os.path.join(os.getcwd(), "logs")
                 )
-                if self.is_authenticated():
+                # Force validation without cache to ensure new token is checked against API
+                if self.is_authenticated(use_cache=False):
                     print("✅ Fyers model re-initialized and validated with REFRESHED token.")
                     return
 
@@ -300,32 +301,47 @@ class FyersDataManager:
 
     def delete_token(self) -> bool:
         """
-        Deletes the stored token file and clears the current session.
-        Returns True if successful, False otherwise.
+        'Corrupts' the access token to test auto-refresh functionality.
+        Preserves the refresh token.
         """
-        print("🗑️ Deleting Fyers token...")
+        print("🗑️ Corrupting Fyers access token for testing...")
         try:
-            if os.path.exists(TOKEN_FILE):
-                os.remove(TOKEN_FILE)
-                print(f"✅ Deleted token file: {TOKEN_FILE}")
-            else:
-                print("⚠️ Token file not found.")
+            # Load existing to get refresh token
+            token_data = self._load_token() or {}
+            refresh_token = token_data.get('refresh_token')
             
-            # Reset internal state
-            self.access_token = None
-            self.fyers = None
+            # Save back with invalid access token
+            new_data = {
+                "access_token": "INVALID_TOKEN_FOR_TESTING",
+                "refresh_token": refresh_token
+            }
+                
+            with open(TOKEN_FILE, 'w') as f:
+                json.dump(new_data, f)
+            print(f"✅ Corrupted access token in: {TOKEN_FILE}")
+            
+            # Reset internal state to invalid
+            self.access_token = "INVALID_TOKEN_FOR_TESTING"
+            # We don't set self.fyers to None, we let it be re-initialized or stay as is
+            # But to ensure is_authenticated fails, we should clear cache
             self._auth_cache = None
             self._auth_cache_time = 0
+            
+            # Re-init model with bad token so next call fails
+            self._initialize_fyers_model()
+            
             return True
         except Exception as e:
-            print(f"❌ Error deleting token file: {e}")
+            print(f"❌ Error clearing access token: {e}")
             return False
 
     def get_historical_index_data(self, index_name: str, start_date: datetime, end_date: datetime, 
                                   interval: str = "1", is_backtest_log: bool = False) -> pd.DataFrame:
         """Fetches historical data for an INDEX."""
         if not self.is_authenticated():
-            raise Exception("Fyers client is not authenticated.")
+             # Try refresh once if not authenticated
+             if not self.refresh_access_token():
+                 raise Exception("Fyers client is not authenticated.")
             
         fyers_symbol = FYERS_INDEX_SYMBOL_MAP.get(index_name)
         if not fyers_symbol:
@@ -351,10 +367,20 @@ class FyersDataManager:
             }
             try:
                 response = self.fyers.history(data=data)
+                
+                # Check for Auth Error
+                if isinstance(response, dict) and (response.get("s") == "error" or response.get("code") == -1):
+                     msg = response.get("message", "").lower()
+                     if "token" in msg or "unauthorized" in msg:
+                          print(f"⚠️ Auth Error in Index Data: {msg}. Refreshing token...")
+                          if self.refresh_access_token():
+                               # Retry once
+                               response = self.fyers.history(data=data)
             except Exception as e:
                 print(f"Fyers API error (Index): {e}. Retrying once...")
                 time.sleep(1) # Wait 1 sec before retry
                 try:
+                    # Check auth again? No, just retry logic
                     response = self.fyers.history(data=data)
                 except Exception as e2:
                     print(f"Fyers API error on retry (Index): {e2}. Skipping chunk.")
@@ -421,7 +447,8 @@ class FyersDataManager:
         Handles the transition from Weekly to Monthly contracts after Nov 13, 2024.
         """
         if not self.is_authenticated():
-            raise Exception("Fyers client is not authenticated.")
+             if not self.refresh_access_token():
+                 raise Exception("Fyers client is not authenticated.")
 
         underlying = FYERS_OPTION_SYMBOL_MAP.get(index_name)
         if not underlying:
@@ -467,6 +494,15 @@ class FyersDataManager:
         try:
             response = self.fyers.history(data=data)
             
+            # Check for Auth Error
+            if isinstance(response, dict) and (response.get("s") == "error" or response.get("code") == -1):
+                 msg = response.get("message", "").lower()
+                 if "token" in msg or "unauthorized" in msg:
+                      print(f"⚠️ Auth Error in Option Data: {msg}. Refreshing token...")
+                      if self.refresh_access_token():
+                           # Retry once
+                           response = self.fyers.history(data=data)
+            
             if response.get("s") == "ok" and response.get("candles"):
                 df = pd.DataFrame(response["candles"])
                 df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
@@ -507,7 +543,8 @@ class FyersDataManager:
         Handles 'NSE:' prefix automatically.
         """
         if not self.is_authenticated():
-            return 0.0
+             if not self.refresh_access_token():
+                 return 0.0
             
         # Ensure NSE: prefix for Fyers
         if not symbol.startswith("NSE:"):
@@ -519,6 +556,15 @@ class FyersDataManager:
         
         try:
             response = self.fyers.quotes(data=data)
+            
+            # Check for Auth Error
+            if isinstance(response, dict) and (response.get("s") == "error" or response.get("code") == -1):
+                 msg = response.get("message", "").lower()
+                 if "token" in msg or "unauthorized" in msg:
+                      print(f"⚠️ Auth Error in Get LTP: {msg}. Refreshing token...")
+                      if self.refresh_access_token():
+                           response = self.fyers.quotes(data=data)
+            
             if response.get("s") == "ok" and response.get("d"):
                 return float(response["d"][0]["v"]["lp"])
             else:
@@ -537,11 +583,22 @@ class FyersDataManager:
                   Required keys: symbol, qty, type, side, productType, limitPrice, stopPrice, validity, offlineOrder, stopLoss, takeProfit
         """
         if not self.is_authenticated():
-            return {"s": "error", "message": "Fyers client not authenticated", "code": -1}
+             if not self.refresh_access_token():
+                 return {"s": "error", "message": "Fyers client not authenticated", "code": -1}
             
         try:
             print(f"🚀 Placing Fyers Order: {data}")
             response = self.fyers.place_order(data=data)
+            
+            # Check for Auth Error
+            if isinstance(response, dict) and (response.get("s") == "error" or response.get("code") == -1):
+                 msg = response.get("message", "").lower()
+                 if "token" in msg or "unauthorized" in msg:
+                      print(f"⚠️ Auth Error in Place Order: {msg}. Refreshing token...")
+                      if self.refresh_access_token():
+                           print("🔄 Retrying Order Placement...")
+                           response = self.fyers.place_order(data=data)
+            
             print(f"Fyers Order Response: {response}")
             return response
         except Exception as e:
@@ -551,10 +608,20 @@ class FyersDataManager:
     def get_positions(self) -> Dict[str, Any]:
         """Fetches current positions from Fyers."""
         if not self.is_authenticated():
-            return {"s": "error", "message": "Fyers client not authenticated"}
+             if not self.refresh_access_token():
+                 return {"s": "error", "message": "Fyers client not authenticated"}
             
         try:
             response = self.fyers.positions()
+            
+            # Check for Auth Error
+            if isinstance(response, dict) and (response.get("s") == "error" or response.get("code") == -1):
+                 msg = response.get("message", "").lower()
+                 if "token" in msg or "unauthorized" in msg:
+                      print(f"⚠️ Auth Error in Get Positions: {msg}. Refreshing token...")
+                      if self.refresh_access_token():
+                           response = self.fyers.positions()
+            
             return response
         except Exception as e:
             print(f"❌ Error fetching Fyers positions: {e}")
@@ -563,10 +630,20 @@ class FyersDataManager:
     def get_orders(self) -> Dict[str, Any]:
         """Fetches order book from Fyers."""
         if not self.is_authenticated():
-            return {"s": "error", "message": "Fyers client not authenticated"}
+             if not self.refresh_access_token():
+                 return {"s": "error", "message": "Fyers client not authenticated"}
             
         try:
             response = self.fyers.orderbook()
+            
+            # Check for Auth Error
+            if isinstance(response, dict) and (response.get("s") == "error" or response.get("code") == -1):
+                 msg = response.get("message", "").lower()
+                 if "token" in msg or "unauthorized" in msg:
+                      print(f"⚠️ Auth Error in Get Orders: {msg}. Refreshing token...")
+                      if self.refresh_access_token():
+                           response = self.fyers.orderbook()
+            
             return response
         except Exception as e:
             print(f"❌ Error fetching Fyers orders: {e}")
@@ -577,7 +654,8 @@ class FyersDataManager:
         Fetches full quote for a symbol (Depth, OHLC, etc).
         """
         if not self.is_authenticated():
-            return {}
+             if not self.refresh_access_token():
+                 return {}
             
         # Ensure NSE: prefix
         if not symbol.startswith("NSE:") and not symbol.startswith("MCX:"): # Basic check, might need more robust handling
@@ -593,6 +671,15 @@ class FyersDataManager:
         data = {"symbols": fyers_symbol}
         try:
             response = self.fyers.quotes(data=data)
+            
+            # Check for Auth Error
+            if isinstance(response, dict) and (response.get("s") == "error" or response.get("code") == -1):
+                 msg = response.get("message", "").lower()
+                 if "token" in msg or "unauthorized" in msg:
+                      print(f"⚠️ Auth Error in Get Quote: {msg}. Refreshing token...")
+                      if self.refresh_access_token():
+                           response = self.fyers.quotes(data=data)
+            
             if response.get("s") == "ok" and response.get("d"):
                 return response["d"][0]["v"]
             return {}
@@ -609,7 +696,8 @@ class FyersDataManager:
             Dictionary mapping symbol -> quote data
         """
         if not self.is_authenticated():
-            return {}
+             if not self.refresh_access_token():
+                 return {}
             
         if not symbols:
             return {}
@@ -620,6 +708,15 @@ class FyersDataManager:
         
         try:
             response = self.fyers.quotes(data=data)
+            
+            # Check for Auth Error
+            if isinstance(response, dict) and (response.get("s") == "error" or response.get("code") == -1):
+                 msg = response.get("message", "").lower()
+                 if "token" in msg or "unauthorized" in msg:
+                      print(f"⚠️ Auth Error in Get Quotes: {msg}. Refreshing token...")
+                      if self.refresh_access_token():
+                           response = self.fyers.quotes(data=data)
+            
             result = {}
             if response.get("s") == "ok" and response.get("d"):
                 for item in response["d"]:
