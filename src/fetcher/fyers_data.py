@@ -3,6 +3,8 @@ from fyers_apiv3 import fyersModel
 from datetime import datetime, timedelta, time as dt_time, date
 from typing import Dict, Optional, Any, List
 import os
+import hashlib
+import requests
 import json
 import time
 import calendar
@@ -44,7 +46,11 @@ class FyersDataManager:
         self._auth_cache_time = 0
         self._auth_cache_ttl = 60  # Cache for 60 seconds
         
-        self.access_token = self._load_token()
+        self._auth_cache_ttl = 60  # Cache for 60 seconds
+        
+        token_data = self._load_token()
+        self.access_token = token_data.get('access_token') if token_data else None
+        self.refresh_token = token_data.get('refresh_token') if token_data else None
         
         # Expose constants
         self.FYERS_INDEX_SYMBOL_MAP = FYERS_INDEX_SYMBOL_MAP
@@ -63,7 +69,21 @@ class FyersDataManager:
         
         # Validate token immediately upon init
         if not self.is_authenticated():
-            print("⚠️ Initial token validation failed (Expired or Invalid). Clearing token file.")
+            print("⚠️ Initial token validation failed. Attempting to refresh token...")
+            if self.refresh_access_token():
+                print("✅ Token refreshed successfully. Re-initializing...")
+                # Recursion avoided because refresh_access_token updates self.access_token and saves file
+                # But we need to re-create the model instance with new token
+                self.fyers = fyersModel.FyersModel(
+                    client_id=self.app_id, 
+                    token=self.access_token,
+                    log_path=os.path.join(os.getcwd(), "logs")
+                )
+                if self.is_authenticated():
+                    print("✅ Fyers model re-initialized and validated with REFRESHED token.")
+                    return
+
+            print("❌ Token refresh failed or expired. Clearing token file.")
             self.fyers = None
             self.access_token = None
             if os.path.exists(TOKEN_FILE):
@@ -75,14 +95,78 @@ class FyersDataManager:
         else:
             print("✅ Fyers model initialized and validated with existing token.")
 
-    def _load_token(self) -> Optional[str]:
-        """Loads the access token from the JSON file."""
+    def refresh_access_token(self) -> bool:
+        """
+        Uses the refresh_token to generate a new access_token.
+        """
+        if not self.refresh_token:
+            print("❌ No refresh token available.")
+            return False
+            
+        print("🔄 Attempting to refresh access token...")
+        try:
+            # 1. Generate appIdHash
+            app_id_hash = hashlib.sha256(f"{self.app_id}:{self.secret_key}".encode()).hexdigest()
+            
+            # 2. Prepare Payload
+            pin = os.getenv("FYERS_PIN", "")
+            payload = {
+                "grant_type": "refresh_token",
+                "appIdHash": app_id_hash,
+                "refresh_token": self.refresh_token,
+                "pin": pin
+            }
+            
+            # 3. Send Request
+            url = "https://api-t1.fyers.in/api/v3/validate-refresh-token"
+            headers = {"Content-Type": "application/json"}
+            
+            response = requests.post(url, json=payload, headers=headers)
+            data = response.json()
+            
+            if response.status_code == 200 and data.get("s") == "ok":
+                new_access_token = data.get("access_token")
+                if new_access_token:
+                    print("✅ New Access Token generated via Refresh Token.")
+                    
+                    # Update internal state
+                    self.access_token = new_access_token
+                    
+                    # Save to file (preserve refresh_token if not returned, though usually it is)
+                    # The response usually contains just access_token. 
+                    # Wait, Fyers V3 refresh endpoint returns a new access token. 
+                    # Does it rotate the refresh token? 
+                    # Documentation says: "The refresh token is valid for 14 days."
+                    # It doesn't explicitly say it rotates on use, but let's keep the old one if not provided.
+                    
+                    token_data = {
+                        "access_token": self.access_token,
+                        "refresh_token": self.refresh_token # Keep existing refresh token
+                    }
+                    
+                    with open(TOKEN_FILE, 'w') as f:
+                        json.dump(token_data, f)
+                        
+                    return True
+                else:
+                    print(f"❌ Refresh successful but no access_token in response: {data}")
+                    return False
+            else:
+                print(f"❌ Refresh Token Failed: {data.get('message', data)}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Exception during token refresh: {e}")
+            return False
+
+    def _load_token(self) -> Optional[Dict[str, Any]]:
+        """Loads the full token data from the JSON file."""
         if os.path.exists(TOKEN_FILE):
             try:
                 with open(TOKEN_FILE, 'r') as f:
                     token_data = json.load(f)
                     print("Loaded existing token from fyers_token.json")
-                    return token_data.get('access_token')
+                    return token_data
             except Exception as e:
                 print(f"Error loading token file: {e}")
                 return None

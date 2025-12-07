@@ -368,3 +368,29 @@ def render_live_dashboard(angel, selected_index, active_strategy_key, strategy_n
     # 3. Backtest results are being viewed (so user can analyze without reload)
     # 4. AI Training is running
     # Auto-refresh moved to top
+
+    # ---------------------------
+    # MongoDB Trade History
+    # ---------------------------
+    st.subheader("🗄️ MongoDB Trade History")
+    if angel and angel.database_manager.connected:
+        try:
+            mongo_trades = angel.database_manager.get_trades(limit=20)
+            if mongo_trades:
+                df_mongo = pd.DataFrame(mongo_trades)
+                # Format timestamp
+                if 'timestamp' in df_mongo.columns:
+                    df_mongo['time'] = pd.to_datetime(df_mongo['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Select columns to display
+                cols = ['time', 'tradingsymbol', 'action', 'quantity', 'price', 'pnl', 'is_paper', 'reason']
+                # Filter cols that exist
+                display_cols = [c for c in cols if c in df_mongo.columns]
+                
+                st.dataframe(df_mongo[display_cols], width='stretch')
+            else:
+                st.info("No trades found in MongoDB.")
+        except Exception as e:
+            st.error(f"❌ Error fetching MongoDB trades: {e}")
+    elif angel and not angel.database_manager.connected:
+        st.warning("⚠️ MongoDB not connected. Check credentials.")

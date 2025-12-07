@@ -12,3 +12,5 @@ requests
 kiteconnect
 yfinance
 setuptools
+pymongo
+dnspython

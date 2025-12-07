@@ -34,6 +34,7 @@ class AngelClient:
         from backtest.backtest import MultiTimeframeStrategy
         from .fyers_socket import FyersSocketManager # --- NEW ---
         from utils.telegram_bot import TelegramBot # --- NEW ---
+        from utils.database_manager import DatabaseManager # --- NEW ---
 
         self.paper = paper
         self.api_key = api_key or os.getenv("ANGEL_API_KEY")
@@ -48,7 +49,9 @@ class AngelClient:
         self.kite_client = kite_client # Optional: Keep for reference or specific data if needed, but primary is Fyers
 
         self.signal_storage = SignalStorage()
+        self.signal_storage = SignalStorage()
         self.telegram_bot = TelegramBot() # Initialize Telegram Bot
+        self.database_manager = DatabaseManager() # Initialize Database Manager
         
         # --- NEW: Socket Manager ---
         self.socket_manager = None
@@ -397,16 +400,37 @@ class AngelClient:
             
             print(f"[DEBUG] Starting Signal Generation at {now_time.strftime('%H:%M:%S')}")
             self.last_signal_check_time = now_ist # Update check time
+
+            # --- NOTIFICATION: Signal Check ---
+            if self.telegram_bot.enabled:
+                 self.telegram_bot.send_message(f"🔍 Checking for signals at {now_time.strftime('%H:%M')}...")
+            # --- END NOTIFICATION ---
+            
+            # --- DB LOGGING: Signal Check Start ---
+            self.database_manager.log_signal_check("START", f"Checking signals at {now_time.strftime('%H:%M')}")
+            # --- END DB LOGGING ---
+
             # --- END MODIFIED ---
             
-            if self.skip_today: return []
-            if self.daily_pnl <= -abs(self.max_daily_loss): return [] 
-            if len(self.positions_map) > 0: return [] 
+            # --- MAINTENANCE CHECK (01:00 AM) ---
+            self.check_maintenance()
+            
+            if self.skip_today: 
+                self.database_manager.log_signal_check("SKIPPED", "Skipping today (Lot cost < Min Investment)")
+                return []
+            if self.daily_pnl <= -abs(self.max_daily_loss): 
+                self.database_manager.log_signal_check("SKIPPED", f"Max daily loss hit ({self.daily_pnl})")
+                return [] 
+            if len(self.positions_map) > 0: 
+                self.database_manager.log_signal_check("SKIPPED", "Position already open")
+                return [] 
             
             try:
                 historical_data = self.get_multi_timeframe_data()
                 if historical_data.empty:
-                    print("No historical data (Fyers), cannot generate signals."); return []
+                    print("No historical data (Fyers), cannot generate signals.")
+                    self.database_manager.log_signal_check("ERROR", "No historical data fetched")
+                    return []
                 
                 active_strategy = self.strategies[self.active_strategy_name]
                 signal = active_strategy.generate_live_signal(historical_data)
@@ -419,6 +443,8 @@ class AngelClient:
                         return []
                     
                     print(f"✅ Strategy Signal Generated: {signal['reason']} (Candle: {signal_ts})")
+                    self.database_manager.log_signal_check("SIGNAL_GENERATED", f"Signal: {signal['reason']}", details=signal)
+                    
                     result = self.execute_strategy_trade(signal)
                     
                     # Update last processed timestamp if trade was attempted (success or fail, we acted on it)
@@ -428,15 +454,27 @@ class AngelClient:
                         self.last_signal_timestamp = signal_ts
                         
                     return result
-                    if result.get('status'):
-                        print(f"✅ Trade Executed: {result.get('message')}")
-                    else:
-                        print(f"❌ Trade Failed: {result.get('message')}")
-                    return [signal] 
                 
+                self.database_manager.log_signal_check("SUCCESS", "No signal generated")
                 return []
             except Exception as e:
-                print(f"❌ Error in signal generation loop: {e}"); return []
+                print(f"❌ Error in signal generation loop: {e}")
+                self.database_manager.log_signal_check("ERROR", f"Exception in loop: {str(e)}")
+                return []
+            
+    def check_maintenance(self):
+        """
+        Runs daily maintenance tasks (e.g., log cleanup) at 01:00 AM.
+        """
+        now = datetime.now(IST)
+        # Check if time is past 01:00 AM
+        if now.hour >= 1:
+            today_str = now.strftime("%Y-%m-%d")
+            # Check if we already ran cleanup today
+            if getattr(self, 'last_cleanup_date', None) != today_str:
+                print(f"🧹 Running Daily Maintenance for {today_str}...")
+                self.database_manager.cleanup_signal_logs(days=2)
+                self.last_cleanup_date = today_str
             
     def execute_strategy_trade(self, signal: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -606,6 +644,20 @@ class AngelClient:
                 if self.telegram_bot.enabled:
                     msg = f"🚀 *REAL TRADE EXECUTED*\n\nSymbol: `{tradingsymbol}`\nAction: BUY\nQty: {quantity}\nPrice: {option_ltp}\nSL: {stop_loss_price}\nTP: {take_profit_price}\nExpiry: {expiry}"
                     self.telegram_bot.send_message(msg)
+                
+                # --- DB LOGGING ---
+                self.database_manager.log_trade({
+                    "timestamp": datetime.now(IST),
+                    "tradingsymbol": tradingsymbol,
+                    "action": "BUY",
+                    "quantity": quantity,
+                    "price": option_ltp,
+                    "stop_loss": stop_loss_price,
+                    "take_profit": take_profit_price,
+                    "is_paper": False,
+                    "strategy": self.active_strategy_name,
+                    "reason": "REAL_ENTRY"
+                })
                 
             return result
             
@@ -786,6 +838,19 @@ class AngelClient:
                         msg = f"{pnl_emoji} *PAPER TRADE EXIT*\n\nSymbol: `{tradingsymbol}`\nAction: SELL\nQty: {quantity}\nPrice: {price}\nPnL: ₹{pnl:.2f}"
                         self.telegram_bot.send_message(msg)
 
+                    # --- DB LOGGING ---
+                    self.database_manager.log_trade({
+                        "timestamp": datetime.now(IST),
+                        "tradingsymbol": tradingsymbol,
+                        "action": "SELL",
+                        "quantity": quantity,
+                        "price": price,
+                        "pnl": pnl,
+                        "is_paper": True,
+                        "strategy": self.active_strategy_name,
+                        "reason": "PAPER_EXIT"
+                    })
+
                     return {"status": True, "message": f"PAPER SELL {quantity} {tradingsymbol} @ {price}", "orderId": order_id, "data": trade_record, "trade_pnl": pnl}
                 else: 
                     self.positions_map[tradingsymbol] = {
@@ -796,6 +861,18 @@ class AngelClient:
                     }
                     order_record = {"timestamp": time.time(), "tradingsymbol": tradingsymbol, "transaction_type": "BUY", "quantity": quantity, "price": price, "status": order_status, "order_id": order_id}
                     self.orders.append(order_record)
+
+                    # --- DB LOGGING ---
+                    self.database_manager.log_trade({
+                        "timestamp": datetime.now(IST),
+                        "tradingsymbol": tradingsymbol,
+                        "action": "BUY",
+                        "quantity": quantity,
+                        "price": price,
+                        "is_paper": True,
+                        "strategy": self.active_strategy_name,
+                        "reason": "PAPER_ENTRY"
+                    })
                     
                     if self.socket_manager:
                         self.socket_manager.subscribe([tradingsymbol])
