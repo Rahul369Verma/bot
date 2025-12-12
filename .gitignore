@@ -1,0 +1,6 @@
+node_modules
+.env
+logs
+*.log
+fyers_token.json
+kite_token.json
